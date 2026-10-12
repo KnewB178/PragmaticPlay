@@ -1,0 +1,1385 @@
+#!/usr/bin/env python3
+r"""
+PP 自动程序（Python 版 · 新建文件夹，不修改原文件夹任何文件）
+跨平台：macOS 与 Windows 共用同一份代码（启动脚本：启动.command / start.bat）
+
+流程：
+  0. 启动直接读入完整 wss URL，从 URL 里取 JSESSIONID 与 tableId（只有这一种登入方式）
+  1. 登入方式固定为「粘贴 URL」：JSESSIONID 直接用粘贴进来的那个
+     （原「自动登入 198198 / Playwright」那套已整体移除 → 不再需要 pycryptodome、playwright）
+  3. 订阅 TC 数据源 ws://pp.knewb2u.com:8888/ws，实时维护 {桌名 → TC} 与完整快照
+  4. 选桌：**直连模式（USE_PASTED_TABLE = True）＝ 粘贴 URL 里是哪个 tableId 就连那张**，
+     掷骰选桌（≥7 正数池 / <7 负数池 / 只收有空位的桌 / 池空等 5 秒重掷）代码保留，开关设 False 即恢复
+  5. tableId → tableConfig API → 构建 wss URL（顺带取该桌最低注额）
+  6. 连接后静默收帧（不打印原始帧）；固定板面显示：桌名/座位/牌靴已出牌/TC/各家点数/EV/动作
+  7. 找空位坐下 → 开局(betsopen)后随机 3–5 秒押主注（金额 = 该桌最低限额）
+  8. 接管 TC 自算（betsopen 时导入 feed 完整已出牌作基线；voip_cc 换鞋清空）
+  9. 轮到我（decisionOffer + activeHand）→ 把手牌 / 庄家明牌 / 全 shoe 已出牌交给
+     PP EV.py 算最优动作 → 随机 3–5 秒后提交 hit / stand / double / split / cashOut
+ 10. 庄家明牌 A：收到保险邀请(notinsured) → 按保险 EV(3p-1) 自动买 / 不买并回执
+ 11. 拉黑只在「下注被拒」时发生：placebetError / betValidationError / 下了注整局没收到牌
+     满桌（没空位）/ 久坐被踢 / 断线 → 只断开回去重掷，不拉黑（下一轮还可能再抽到）
+"""
+
+import os, sys, json, time, random, asyncio, configparser, importlib.util, unicodedata
+import traceback
+from pathlib import Path
+from datetime import datetime
+from urllib.parse import urlparse, parse_qs
+
+# Windows 控制台默认 GBK，先把 stdout/stderr 切到 UTF-8 ——
+# 否则打印 emoji（❌📋🧠 等）与板面边框字符会抛 UnicodeEncodeError 直接崩
+if os.name == "nt":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+
+# 崩溃兜底：双击 .py 运行时窗口默认一闪就关，看不到出错原因。
+# 这里挂住所有未捕获异常（含 import 阶段失败的），打印完整 traceback 并停住等回车。
+def _crash_hold(exc_type, exc_value, exc_tb):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)   # Ctrl+C 按原样处理，不停
+        return
+    traceback.print_exception(exc_type, exc_value, exc_tb)
+    print("\n[💥] Program crashed — see the error above.")
+    try:
+        # 只有在真正的终端里才等回车，管道/计划任务等非交互场景不会卡住
+        if sys.stdin is not None and sys.stdin.isatty():
+            input("Press Enter to close ...")
+    except Exception:
+        pass
+
+
+sys.excepthook = _crash_hold
+
+# 自动切换到项目 venv 的 Python（跨平台：Windows 走 Scripts\python.exe）
+# PyInstaller 打包后（frozen）：没有 venv，数据文件（PP EV.py / table_id.txt / bot_config.ini）
+# 被解压到 sys._MEIPASS → 直接用解包目录当根，路径才读得到。
+_FROZEN = getattr(sys, "frozen", False)
+if _FROZEN:
+    _HERE = Path(getattr(sys, "_MEIPASS", str(Path(sys.executable).resolve().parent)))
+else:
+    # 项目根：常规布局 = 上一级（PP自动程序/ 的父目录）；自包含部署 = 本目录（依赖与本文件同级）
+    _HERE = Path(__file__).resolve().parent
+ROOT = _HERE if (_HERE / "table_id.txt").exists() else _HERE.parent
+if os.name == "nt":
+    _venv_py = ROOT / "venv" / "Scripts" / "python.exe"
+else:
+    _venv_py = ROOT / "venv" / "bin" / "python3"
+# 用 normcase 比较，避免 Windows 盘符/大小写差异导致误判 → 反复重启自己
+_same_exe = (os.path.normcase(os.path.abspath(sys.executable))
+             == os.path.normcase(os.path.abspath(str(_venv_py))))
+if not _FROZEN and not _same_exe and _venv_py.exists():
+    # 注意：Windows 下 os.execv 不会给带空格的路径加引号（本项目路径 "PP AutoBot" 含空格），
+    # 会把命令行解析成 C:\Users\user\Desktop\PP + 其余部分 → 报 "can't open file ..."。
+    # 改用 subprocess（内部 list2cmdline 会自动加引号），父进程等子进程结束再退出。
+    import subprocess
+    sys.exit(subprocess.call([str(_venv_py)] + sys.argv))
+
+sys.path.insert(0, str(ROOT))
+
+# 静音 requests 的 RequestsDependencyWarning —— 本机「应用程序控制策略」会拦 charset_normalizer
+# 自带的 cd.pyd，requests 因此误判「找不到字符检测库」而打这行警告。纯外观，请求本身正常。
+# 注意：过滤器必须在 import requests 之前装好（该警告是 requests 在 import 那一刻发出的）。
+import warnings
+warnings.filterwarnings("ignore", message=r".*character detection dependency.*")
+
+import requests
+import websockets
+from colorama import init, Fore, Style
+
+# ══════════════ DNS 兜底 ══════════════
+# 本机路由器/ISP 的 DNS 会把 PP 的 API 域名解析到一个「死」IP：
+#   实测 games.pragmaticplaylive.net → 175.139.142.25（443 全超时，连不上）
+#   而 8.8.8.8 / 1.1.1.1          → 18.67.181.x（AWS CloudFront，0.01s 就连上）
+# 后果就是 build_ws_url() 的 tableConfig 请求 ConnectTimeout，选桌一直失败。
+# 解决：对 pragmaticplaylive.net 下的域名改用公共 DNS 解析（UDP 53，结果缓存），
+#       公共 DNS 拿不到结果时自动回退系统 DNS。完全可逆：删掉本段即恢复原行为。
+import socket, struct
+
+_DNS_SUFFIX = "pragmaticplaylive.net"
+_DNS_SERVERS = ("8.8.8.8", "1.1.1.1")
+_dns_cache = {}          # host -> [ip, ...]（只缓存成功结果）
+_dns_retry_after = 0.0   # 公共 DNS 失败后的冷却截止时间（避免每次请求都卡 3 秒）
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _dns_query_a(server: str, name: str, timeout: float = 3.0):
+    """手搓一个 A 记录 DNS 查询（UDP 53），返回 IPv4 列表。"""
+    q = b"".join(bytes([len(p)]) + p.encode() for p in name.split(".")) + b"\x00" + struct.pack(">HH", 1, 1)
+    pkt = struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0) + q
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(pkt, (server, 53))
+        data, _ = s.recvfrom(2048)
+    finally:
+        s.close()
+    ancount = struct.unpack(">H", data[6:8])[0]
+    idx = 12
+    while data[idx] != 0:                      # 跳过问题段里的域名
+        idx += data[idx] + 1
+    idx += 5
+    ips = []
+    for _ in range(ancount):
+        if data[idx] & 0xC0 == 0xC0:           # 压缩指针
+            idx += 2
+        else:
+            while data[idx] != 0:
+                idx += data[idx] + 1
+            idx += 1
+        typ, _cls, _ttl, rdlen = struct.unpack(">HHIH", data[idx:idx + 10])
+        idx += 10
+        if typ == 1 and rdlen == 4:
+            ips.append(".".join(str(b) for b in data[idx:idx + 4]))
+        idx += rdlen
+    return ips
+
+
+def _patched_getaddrinfo(host, port, *args, **kwargs):
+    """只拦 pragmaticplaylive.net：先用公共 DNS 拿 IP，再交给原生解析器。"""
+    global _dns_retry_after
+    if isinstance(host, str) and host.endswith(_DNS_SUFFIX):
+        ips = _dns_cache.get(host)
+        if ips is None and time.time() >= _dns_retry_after:
+            for srv in _DNS_SERVERS:
+                try:
+                    ips = _dns_query_a(srv, host)
+                except Exception:
+                    continue
+                if ips:
+                    _dns_cache[host] = ips
+                    print(f"  [🌐] DNS override: {host} -> {', '.join(ips)}  (via {srv})", flush=True)
+                    break
+            if not ips:
+                _dns_retry_after = time.time() + 30   # 30 秒内不再试公共 DNS，直接走系统 DNS
+        if ips:
+            resolved = []
+            for ip in ips:
+                try:
+                    resolved.extend(_orig_getaddrinfo(ip, port, *args, **kwargs))
+                except Exception:
+                    pass
+            if resolved:
+                return resolved
+    return _orig_getaddrinfo(host, port, *args, **kwargs)
+
+
+socket.getaddrinfo = _patched_getaddrinfo
+
+# 登入方式只有一种：「粘贴完整 wss URL」。
+# 原本的自动登入（login_198198 → pycryptodome；WSS → playwright）已整体移除 ——
+# 那两个库都带未签名 .pyd，本机「应用程序控制策略」会拦，而且现在也用不到。
+
+# ══════════════ numpy 兜底 ══════════════
+# 本机若开着「应用程序控制策略」(WinError 4551)，numpy 的 .pyd 会被系统拦住（无签名）。
+# PP EV.py 对 numpy 的用法只有一件事：np.zeros(shape, dtype) 建零数组，
+# 之后全是 arr[i] / arr[i, j] 下标读写 + 一处 .shape[1]，数学语义与纯 Python 嵌套列表完全一致。
+# 所以真 numpy 起不来时，往 sys.modules 塞一个只实现 zeros 的替身 —— PP EV.py 一个字都不用改，
+# 换回正常机器时真 numpy 会自动生效，这个替身完全不参与。
+def _numpy_fallback():
+    import types
+
+    class _Zeros:
+        __slots__ = ("_d", "shape")
+
+        def __init__(self, shape, dtype=float):
+            shape = (shape,) if isinstance(shape, int) else tuple(shape)
+            self.shape = shape
+            fill = 0 if dtype is int else 0.0
+            self._d = ([fill] * shape[0] if len(shape) == 1
+                       else [[fill] * shape[1] for _ in range(shape[0])])
+
+        def __getitem__(self, k):
+            return self._d[k[0]][k[1]] if isinstance(k, tuple) else self._d[k]
+
+        def __setitem__(self, k, v):
+            if isinstance(k, tuple):
+                self._d[k[0]][k[1]] = v
+            else:
+                self._d[k] = v
+
+    _m = types.ModuleType("numpy")
+    _m.zeros = _Zeros
+    sys.modules["numpy"] = _m
+
+
+try:
+    import numpy  # noqa: F401 —— 没被策略拦就用真 numpy，行为与本机原本完全一致
+    del numpy
+except Exception as _np_err:
+    # 清掉半残的 numpy 子模块，免得 PP EV.py 拿到坏模块
+    for _k in [k for k in list(sys.modules) if k == "numpy" or k.startswith("numpy.")]:
+        sys.modules.pop(_k, None)
+    _numpy_fallback()
+    print(f"  [!] numpy blocked by system policy ({_np_err.__class__.__name__}) "
+          f"— PP EV.py will use the built-in zeros shim")
+
+# 复用 EV 程序（只 import，不修改）—— composition-dependent，用 8 副牌剩牌全量推演
+_ev_spec = importlib.util.spec_from_file_location("pp_ev", ROOT / "PP EV.py")
+_ev_mod = importlib.util.module_from_spec(_ev_spec)
+_ev_spec.loader.exec_module(_ev_mod)
+calc_ev = _ev_mod.calc_ev
+
+init(autoreset=True)
+
+HERE = _HERE   # 打包(frozen)后 = sys._MEIPASS；否则 = main.py 所在目录
+
+# ─────────────────────────── 配置 ───────────────────────────
+_cfg = configparser.ConfigParser()
+_cfg.read(HERE / "bot_config.ini", encoding="utf-8")
+USERNAME = _cfg["bot"]["username"].strip()
+PASSWORD = _cfg["bot"]["password"].strip()
+BASE_URL = _cfg["bot"].get("base_url", "https://www.198198.io").strip().rstrip("/")
+FEED_URL = _cfg["bot"].get("feed_url", "ws://pp.knewb2u.com:8888/ws").strip()
+
+POOL_EMPTY_WAIT = 5      # 候选池为空时等待秒数后重掷
+HEARTBEAT_INTERVAL = 10  # 心跳间隔秒数
+RECONNECT_WAIT = 2       # 断开后重掷前等待秒数
+BET_DELAY_MIN = 3        # 开局后随机延时下限（秒）再提交主注
+BET_DELAY_MAX = 5        # 开局后随机延时上限（秒）
+FALLBACK_BET = 10        # 查不到该桌最低限额时的兜底注额
+
+ACTION_DELAY_MIN = 3     # 轮到我后随机延时下限（秒）再提交动作
+ACTION_DELAY_MAX = 5     # 轮到我后随机延时上限（秒）
+DECISION_WINDOW = 12     # 回合窗口保护：从收到 decisionOffer 起超过这个秒数就不再提交
+USE_CASHOUT = True       # 允许「提前兑现」参与自动决策（原样交 PP EV.py 按它的公式排；False = 不兑现）
+
+# ── 测试用：临时固定桌，跳过掷骰选桌（留空字符串 = 恢复正常掷骰选桌） ──
+# 目的：先验证下注提交格式是否被平台接受。桌名必须存在于 table_id.txt。
+FIXED_TABLE = ""
+# ─────────────────────────────────────────────────────────────
+
+# ── 直连模式：粘贴 URL 里是哪个 tableId 就连那张桌，跳过掷骰选桌 ──
+#     True  = 直连（选桌逻辑暂时搁置，代码仍保留在 pick_table 里）
+#     False = 恢复掷骰选桌（原行为）
+USE_PASTED_TABLE = True
+# ─────────────────────────────────────────────────────────────
+
+# ── 掷骰选桌的桌名范围：只在这些桌名开头的桌里挑（"" = 全部桌） ──
+TABLE_PREFIX = ""
+# ─────────────────────────────────────────────────────────────
+
+# ── 无基线时连上即开算（直连模式常用：粘的桌号不在 table_id.txt 就没有 feed 快照）──
+#     True  = 连上后第一局就接管，已出张数/TC 从 0 开始算；收到洗牌信号照样清零
+#     False = 旧行为：没基线就一直不算，直到碰上一次洗牌才接管
+TAKEOVER_WITHOUT_BASELINE = True
+# ─────────────────────────────────────────────────────────────
+
+# ── 断线（非主动断开）时是否停止重连 ──
+#     True  = 断线即停止（不退出程序、窗口保留，面板显示 "STOPPED: disconnected"）
+#     False = 旧行为：等 RECONNECT_WAIT 秒后自动重连同一张桌
+STOP_ON_DISCONNECT = True
+# ─────────────────────────────────────────────────────────────
+
+# ── TC 数据源「网络端」(relay feed, pp.knewb2u.com) 开关 ──
+#     True  = 正常行为：连 feed 拿「这张桌已出牌」的现成快照当 TC 基线
+#     False = 完全停用网络端：不做任何 feed 连接；连上桌后直接无基线接管（TC 从 0 起算）
+#     ★ 改回 True 即恢复原行为，其余代码无需改动
+USE_FEED = True
+# ─────────────────────────────────────────────────────────────
+
+tc_map = {}    # 桌名 → 最新 TC（主程序推的）
+snap_map = {}  # 桌名 → 最新完整快照 payload（含 cards 全量 / tc / timestamp）
+BLACKLIST = set()  # 下注被拒的桌名（进程内有效，重启即清空，不再重复挑）
+
+# TC 数据源开关：开局把快照搬进本地账本后即暂停收 feed（之后全靠本地自算）；
+# 需要新基线时（每轮重连桌之前）自动接回
+feed_ctl = {"want": USE_FEED}
+
+# 桌台连接计时：连上（subscribe 确认）开始计，断开暂停/停止
+conn_clock = {"since": None, "elapsed": 0.0, "running": False}
+
+
+def conn_tick():
+    """把连接时长搬进 UI（板面上显示的秒数）"""
+    UI["conn_secs"] = conn_clock["elapsed"]
+
+
+def conn_start():
+    conn_clock["since"] = time.monotonic()
+    conn_clock["elapsed"] = 0.0
+    conn_clock["running"] = True
+    conn_tick()
+
+
+def conn_stop():
+    """停止计时并把最终时长定格（断线/停止时用）"""
+    if conn_clock["running"] and conn_clock["since"] is not None:
+        conn_clock["elapsed"] += time.monotonic() - conn_clock["since"]
+    conn_clock["since"] = None
+    conn_clock["running"] = False
+    conn_tick()
+
+
+def conn_reset():
+    conn_clock["since"] = None
+    conn_clock["elapsed"] = 0.0
+    conn_clock["running"] = False
+    conn_tick()
+
+
+# ═══════════════ 固定板面 UI（不滚动，只刷新变化值）═══════════════
+from collections import deque
+
+SHOE_TOTAL = 416          # 8 副牌
+UI_W = 78                 # 板面宽度
+UI = {
+    "active": False,            # 进入主循环后才整屏渲染（之前正常逐行打印）
+    "table": "—", "min_bet": None, "my_seat": None,
+    "feed": "connecting…" if USE_FEED else "off (feed disabled)", "login": "",
+    "balance": None,            # 余额（HTTP 轮询）
+    "currency": "MYR",
+    "conn_secs": 0.0,           # 这张桌的已连接时长（秒）
+    "stopped": "",              # 非空 = 已停止（显示 STOPPED 原因）
+    "shoe_n": 0, "tc": 0.0, "taken": False,
+    "round": "—", "dealer": "—",
+    "occupy": {},               # 座位 → 玩家名（连接期间）
+    "scores": {},               # 本局: 座位 → 点数（暂不上屏，留着方便恢复）
+    "me_hands": ["", ""],       # 我这两手牌的文字（板面 hand1 / hand2）
+    "ev": "", "action": "",
+    "events": deque(maxlen=10),
+}
+
+
+def _dwidth(s: str) -> int:
+    """显示宽度：东亚宽字符（CJK、emoji）算 2，其余算 1 —— 与 macOS 终端一致"""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in s)
+
+
+def _clip(s: str, w: int) -> str:
+    s, out, width = str(s), "", 0
+    for ch in s:
+        cw = _dwidth(ch)
+        if width + cw > w - 1:
+            return out + "…"
+        out += ch
+        width += cw
+    return out
+
+
+def _pad(s: str, w: int) -> str:
+    return s + " " * max(0, w - _dwidth(s))
+
+
+def _hms(secs: float) -> str:
+    """秒 → HH:MM:SS"""
+    s = int(secs)
+    return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+
+def _tc_color(v: float) -> str:
+    return Fore.GREEN if v >= 1 else (Fore.CYAN if v >= 0 else Fore.RED)
+
+
+def seat_disp(s) -> str:
+    """座位号「显示用」换算：协议 0–6 → 显示 1–7。只影响屏幕输出，发给服务器的永远是 0–6。"""
+    try:
+        n = int(s)
+    except (TypeError, ValueError):
+        return "—"
+    return str(n + 1) if n >= 0 else "D"
+
+
+def hand_disp(i) -> str:
+    """手序号「显示用」换算：协议 0/1 → 显示 1/2。只影响屏幕输出。"""
+    try:
+        return str(int(i) + 1)
+    except (TypeError, ValueError):
+        return "—"
+
+
+def render():
+    """整屏重画固定板面（只在事件发生时调用，平时不滚动）"""
+    if not UI["active"]:
+        return
+    W = UI_W
+    bar = "─" * W
+
+    def row(txt, color=""):
+        t = _pad(_clip(txt, W - 2), W - 2)
+        return "│ " + (color + t + Style.RESET_ALL if color else t) + " │"
+
+
+
+    taken_txt = "taken · local TC" if UI["taken"] else "waiting for snapshot"
+
+    if UI.get("stopped"):
+        L = ["┌" + bar + "┐",
+             row(f"PP AutoBot   Table: {UI['table']}   Min bet {UI['min_bet'] or '?'}   "
+                 f"My seat {seat_disp(UI['my_seat'])}"),
+             row(f"Balance: {UI.get('currency') or 'MYR'} "
+                 f"{UI['balance'] if UI['balance'] is not None else '—'}",
+                 Fore.YELLOW),
+             row(f"Connected: {_hms(UI['conn_secs'])}",
+                 Fore.RED),
+             row(f"State: STOPPED — {UI['stopped']}", Fore.RED),
+             row(f"Feed: {UI['feed']}   Login: {UI['login']}"),
+             "├" + bar + "┤",
+             row(f"Shoe {UI['shoe_n']}/{SHOE_TOTAL}   {taken_txt}   TC {UI['tc']:+.2f}",
+                 _tc_color(UI["tc"])),
+             "├" + bar + "┤",
+             row(f"GameID : {UI['round']}"),
+             row(f"Dealer : {UI['dealer']}"),
+             row("Me"),
+             row(f"hand1 : {UI['me_hands'][0]}".rstrip()),
+             row(f"hand2 : {UI['me_hands'][1]}".rstrip())]
+    else:
+        L = ["┌" + bar + "┐",
+             row(f"PP AutoBot   Table: {UI['table']}   Min bet {UI['min_bet'] or '?'}   "
+                 f"My seat {seat_disp(UI['my_seat'])}"),
+             row(f"Balance: {UI.get('currency') or 'MYR'} "
+                 f"{UI['balance'] if UI['balance'] is not None else '—'}",
+                 Fore.YELLOW),
+             row(f"Connected: {_hms(UI['conn_secs'])}", Fore.MAGENTA),
+             row("State: running", Fore.GREEN),
+             row(f"Feed: {UI['feed']}   Login: {UI['login']}"),
+             "├" + bar + "┤",
+             row(f"Shoe {UI['shoe_n']}/{SHOE_TOTAL}   {taken_txt}   TC {UI['tc']:+.2f}",
+                 _tc_color(UI["tc"])),
+             "├" + bar + "┤",
+             row(f"GameID : {UI['round']}"),
+             row(f"Dealer : {UI['dealer']}"),
+             row("Me"),
+             row(f"hand1 : {UI['me_hands'][0]}".rstrip()),
+             row(f"hand2 : {UI['me_hands'][1]}".rstrip())]
+    L.append(row(f"EV :  {UI['ev']}".rstrip()))
+    L.append(row(f"Action : {UI['action']}".rstrip()))
+    L += ["└" + bar + "┘",
+          f"{Fore.CYAN}{Style.DIM}  " + bar + f"{Style.RESET_ALL}",
+          f"{Fore.CYAN}{Style.DIM}  Recent events (cleared each new round){Style.RESET_ALL}"]
+    L += [f"  {line}" for line in list(UI["events"])[-8:]]
+
+    print("\033[H\033[J", end="")          # 光标回原点 + 清屏 → 固定板面不滚动
+    print("\n".join(L), flush=True)
+
+
+def log(msg, color=""):
+    if UI["active"]:
+        UI["events"].append(f"{color}{msg}{Style.RESET_ALL}")
+        render()
+    else:
+        print(f"{color}{msg}{Style.RESET_ALL}", flush=True)
+
+
+def load_tables() -> dict:
+    """读 table_id.txt：桌名 → 桌号"""
+    tables = {}
+    with open(ROOT / "table_id.txt", encoding="utf-8") as f:
+        for line in f:
+            if "|" in line:
+                name, tid = [x.strip() for x in line.split("|", 1)]
+                tables[name] = tid
+    return tables
+
+
+# ═══════════════════════ ⓪ 启动时读入登入 URL ═══════════════════════
+def ask_pasted_jsid():
+    """读入完整 wss URL，取出 JSESSIONID 与 tableId（%21 会还原成 !）
+
+    直连模式下 tableId 就是「要连的那一张桌」，所以必须能从 URL 里解析出来。
+    返回 (JSESSIONID, tableId)。
+    """
+    print("  Paste the full wss URL:")
+    while True:
+        try:
+            u = input("  URL: ").strip()
+        except EOFError:
+            raise RuntimeError("no URL entered")
+        if not u:
+            print("  Empty input — paste again:")
+            continue
+        if "JSESSIONID=" not in u:
+            print("  No JSESSIONID= in that URL — check and paste again:")
+            continue
+        q = parse_qs(urlparse(u).query)
+        sid = q.get("JSESSIONID", [""])[0]
+        if not sid:
+            print("  Could not parse JSESSIONID from that URL — paste again:")
+            continue
+        tid = q.get("tableId", [""])[0]
+        if USE_PASTED_TABLE and not tid:
+            print("  No tableId= in that URL (direct mode needs it) — paste again:")
+            continue
+        log(f"  [✅] JSESSIONID: {sid}", Fore.GREEN)
+        if USE_PASTED_TABLE:
+            log(f"  [🎯] tableId from URL: {tid}", Fore.GREEN)
+        return sid, tid
+
+
+def ask_bet_amount() -> int:
+    """读到合法整数注额为止；直接回车 = 用该桌最低限额（自动）"""
+    print("  Enter bet amount (blank = use table minimum):")
+    while True:
+        try:
+            raw = input("  Bet: ").strip()
+        except EOFError:
+            raise RuntimeError("no bet amount entered")
+        if not raw:
+            log("  [💰] Bet amount: auto (table minimum)", Fore.CYAN)
+            return None
+        try:
+            amt = int(float(raw))
+        except ValueError:
+            print("  Not a number — enter an integer (e.g. 10):")
+            continue
+        if amt <= 0:
+            print("  Must be > 0 — enter again:")
+            continue
+        log(f"  [💰] Bet amount: {amt} (fixed for every round)", Fore.GREEN)
+        return amt
+
+
+# ═══════════════════════ ⓪b 余额（HTTP 轮询，非 wss） ═══════════════════════
+# 余额不在任何 wss 帧里（已实测 game / dga-lc / ws1 三条都没有），走 HTTP：
+#   GET https://games.pplc001.net/api/wallet/balance?JSESSIONID=<sid>
+#   响应: {"balance":"2494.25","bonusBalance":"0.00","currency":"MYR", ...}
+BALANCE_URL = "https://games.pplc001.net/api/wallet/balance"
+BALANCE_INTERVAL = 3      # 轮询间隔（秒）
+
+
+def fetch_balance(sid: str):
+    """返回 (balance, currency)，失败返回 None"""
+    try:
+        r = requests.get(f"{BALANCE_URL}?JSESSIONID={sid}", timeout=8,
+                         headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                                                "AppleWebKit/537.36",
+                                  "Accept": "application/json, text/plain, */*"})
+        r.raise_for_status()
+        j = r.json() or {}
+        bal = j.get("balance")
+        cur = j.get("currency") or "MYR"
+        if bal is None:
+            return None
+        return (f"{float(bal):,.2f}", cur)
+    except Exception:
+        return None
+
+
+async def balance_task(sid: str):
+    """定时轮询余额 → 面板常驻显示；数值没变就不重画（避免无谓刷屏）"""
+    while True:
+        got = await asyncio.to_thread(fetch_balance, sid)
+        if got:
+            bal, cur = got
+            if UI["balance"] != bal or UI.get("currency") != cur:
+                UI["balance"] = bal
+                UI["currency"] = cur
+                render()
+        await asyncio.sleep(BALANCE_INTERVAL)
+
+
+# ═══════════════════════ ① TC 数据源订阅 ═══════════════════════
+async def feed_task():
+    first, paused = True, False
+    while True:
+        if not feed_ctl["want"]:
+            paused = True
+            await asyncio.sleep(1)     # 已暂停：等主流程要新基线时把 want 翻回来
+            continue
+        if first or paused:
+            first = paused = False
+            UI["feed"] = "connected"
+            log("  [📡] Feed connected (pp.knewb2u.com:8888)", Fore.GREEN)
+        try:
+            async with websockets.connect(FEED_URL) as ws:
+                feed_ctl["ws"] = ws
+                async for raw in ws:
+                    try:
+                        m = json.loads(raw)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if m.get("type") != "mqtt_msg":
+                        continue
+                    p = m.get("payload") or {}
+                    topic = p.get("topic", "")
+                    if topic.startswith("pp/table/"):
+                        name = topic[len("pp/table/"):]
+                        body = p.get("payload") or {}
+                        tc_map[name] = body.get("tc", 0)
+                        snap_map[name] = body   # 完整快照，接管 TC 自算时作基线
+                feed_ctl["ws"] = None
+        except Exception as e:
+            feed_ctl["ws"] = None
+            if feed_ctl["want"]:       # 非主动暂停才报警重连
+                UI["feed"] = "feed down · retry in 3s"
+                log(f"  [⚠️] Feed down: {e} — reconnecting in 3s", Fore.RED)
+                await asyncio.sleep(3)
+
+
+def feed_pause():
+    """基线到手 → 立刻主动断开 feed（之后全靠本地自算）"""
+    feed_ctl["want"] = False
+    UI["feed"] = "off · local TC"
+    ws = feed_ctl.get("ws")
+    if ws is not None:
+        asyncio.ensure_future(ws.close())
+
+
+# ═══════════════════════ ③ 掷骰选桌 ═══════════════════════
+def snap_free_seats(name: str):
+    """按主程序快照估这桌还剩几个空位（只用于选桌前的粗筛）。
+
+    来源是快照里的 player_names：有名字的座位算有人，没名字的算空。
+    返回 0..7；None = 判断不了（没有快照，或快照里没带座位名单）。
+    连桌后服务器给的座位表才是准的，这里只是尽量避开明显满桌的。
+    """
+    snap = snap_map.get(name)
+    if not snap:
+        return None
+    names = snap.get("player_names")
+    if not names:
+        return None
+    occ = [k for k, v in names.items() if str(v or "").strip()]
+    return max(0, 7 - len(occ))
+
+
+async def pick_table(tables: dict) -> str:
+    # 测试模式：固定桌，跳过掷骰
+    if FIXED_TABLE:
+        if FIXED_TABLE not in tables:
+            log(f"  [❌] Fixed table '{FIXED_TABLE}' is not in table_id.txt — "
+                f"add a line 'name | tableId' first", Fore.RED)
+            raise SystemExit(1)
+        log(f"  [📌] TEST MODE: fixed table {FIXED_TABLE} (dice roll skipped)", Fore.CYAN)
+        # 直接采用主程序推来的这张桌的快照（已出牌清单），到手才连桌；
+        # 最多等 30 秒，等不到也照常连（第一局可能没有 TC 基线，不卡死程序）
+        waited = 0
+        while FIXED_TABLE not in snap_map and waited < 30:
+            if waited == 0:
+                log("  [⏳] Waiting for this table's snapshot from the main app...", Fore.YELLOW)
+            await asyncio.sleep(2)
+            waited += 2
+        if FIXED_TABLE in snap_map:
+            n = len(snap_map[FIXED_TABLE].get("cards") or [])
+            log(f"  [📡] Snapshot received: {n} cards dealt "
+                f"(stored only, loaded as baseline at round start)", Fore.GREEN)
+        else:
+            log("  [⚠️] Snapshot not received — connecting anyway (first round may lack a baseline)", Fore.YELLOW)
+        return FIXED_TABLE
+
+    while True:
+        if not tc_map:
+            log("  [⏳] No TC data yet — waiting...", Fore.YELLOW)
+            await asyncio.sleep(3)
+            continue
+
+        roll = random.randint(1, 10)
+        want_positive = roll >= 7
+        label = "positive (>=0)" if want_positive else "negative (<0)"
+        scope = f"{TABLE_PREFIX}*" if TABLE_PREFIX else "all tables"
+        pool = [n for n, tc in tc_map.items()
+                if n in tables and n not in BLACKLIST
+                and n.startswith(TABLE_PREFIX)
+                and (tc >= 0) == want_positive]
+
+        # 再筛一层：只留有「空位」的桌（按主程序快照的座位名单粗估）
+        frees = {n: snap_free_seats(n) for n in pool}
+        ready = [n for n in pool if (frees[n] or 0) >= 1]
+        if not ready:
+            full = sum(1 for n in pool if frees[n] == 0)
+            unknown = sum(1 for n in pool if frees[n] is None)
+            log(f"  [🎲] Rolled {roll} -> want {label} table | scope {scope} | "
+                f"no table with a free seat ({len(pool)} candidates: "
+                f"{full} full, {unknown} unknown) — re-rolling in {POOL_EMPTY_WAIT}s", Fore.YELLOW)
+            await asyncio.sleep(POOL_EMPTY_WAIT)
+            continue
+
+        name = random.choice(ready)
+        log(f"  [🎲] Rolled {roll} -> want {label} table | scope {scope} | "
+            f"{len(ready)}/{len(pool)} have a free seat | picked: {name} "
+            f"(TC {tc_map[name]}, {frees[name]} free)", Fore.CYAN)
+        return name
+
+
+# ═══════════════════════ ④ 构建选中桌的 wss（顺带取该桌最低下注限额） ═══════════════════════
+def build_ws_url(sid: str, table_id: str):
+    """返回 (wss url, 该桌最低下注限额)；限额查不到时为 None"""
+    url = (f"https://games.pragmaticplaylive.net/api/ui/tableConfig"
+           f"?JSESSIONID={sid}&tableId={table_id}&operatorNotification=true")
+    resp = requests.get(url, timeout=5, headers={
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    })
+    resp.raise_for_status()
+    params = resp.json().get("params") or {}
+    ws_address = params.get("ws_address")
+    if not ws_address:
+        raise RuntimeError("no ws_address in tableConfig response")
+    try:
+        min_bet = int(float(params.get("table_bet_min_limit")))
+    except (TypeError, ValueError):
+        min_bet = None
+    return (f"{ws_address}?JSESSIONID={sid}&tableId={table_id}&type=json&version=3", min_bet)
+
+
+# ═══════════════════════ TC 自算（Hi-Lo，与主程序 PPBJ.py 完全同算法） ═══════════════════════
+COUNT_VALUES = {"2": 1, "3": 1, "4": 1, "5": 1, "6": 1,
+                "7": 0, "8": 0, "9": 0,
+                "10": -1, "J": -1, "Q": -1, "K": -1, "A": -1}
+CARD_MAP = {"0": "10", "1": "A"}   # scanCode 首字符 → 点数
+SHOE_CARDS = 416                   # 8 副牌
+
+
+def _hand_cards(hand: dict) -> list:
+    """从 playerSeat 的一手牌里取出点数序列"""
+    out = []
+    for c in (hand.get("cards") or []):
+        code = c.get("scanCode", "") if isinstance(c, dict) else ""
+        if code:
+            out.append(CARD_MAP.get(code[0], code[0]))
+    return out
+
+
+class ShoeCounter:
+    """自己维护整个 shoe 的已出牌并算 TC（接管后不再依赖主程序推的 tc）"""
+
+    def __init__(self):
+        self.cards = []   # 整个 shoe 至今所有已出牌
+        self.hands = {}   # "座位_手" → 该手牌已知的牌（用来取增量、避免重复扣）
+        self.tc = 0.0
+
+    def load_baseline(self, cards):
+        """接管点：导入主程序的完整已出牌作为基线"""
+        self.cards = list(cards or [])
+        self.hands = {}
+        self.recompute()
+
+    def clear(self):
+        """换鞋：整个 shoe 归零"""
+        self.cards = []
+        self.hands = {}
+        self.tc = 0.0
+
+    def new_round(self):
+        """新一局：只清手牌记账，已出牌继续累积"""
+        self.hands = {}
+
+    def feed_player_seat(self, ps: dict) -> int:
+        """把一条 playerSeat 里的新牌计入，返回新增张数"""
+        seat = ps.get("seatNumber")
+        seat_key = "D" if seat == -1 else str(seat)
+
+        # 拆牌：h1 出现时，h0 若显示成两张相同的牌，截成一张（与主程序一致）
+        if "h1" in ps:
+            h0_key = f"{seat_key}_h0"
+            known = self.hands.get(h0_key)
+            if known and len(known) == 2 and known[0] == known[1]:
+                self.hands[h0_key] = known[:1]
+
+        added = 0
+        for key, hand in ps.items():
+            if not key.startswith("h") or not isinstance(hand, dict):
+                continue
+            cards = _hand_cards(hand)
+            if not cards:
+                continue
+            hkey = f"{seat_key}_{key}"
+            known = self.hands.get(hkey, [])
+            if len(cards) > len(known):
+                new = cards[len(known):]
+                self.hands[hkey] = cards
+                self.cards.extend(new)
+                added += len(new)
+
+        if added:
+            self.recompute()
+        return added
+
+    def recompute(self):
+        rc = sum(COUNT_VALUES.get(c, 0) for c in self.cards)
+        decks_remaining = max(1, (SHOE_CARDS - len(self.cards)) / 52)
+        self.tc = round(rc / decks_remaining, 2)
+
+
+# ═══════════════════════ ⑤ 连接选中桌 · 打印全部内容 + 心跳 + 空位检测 + TC 自算 ═══════════════════════
+# ── wss 的 TLS 证书校验：用 certifi 的证书库（requests 同款，PyInstaller 会一并打进 exe）──
+# 原因：部分 Windows（尤其新装的 VPS）系统根证书库不全，而 PP 的 wss 服务器不回传完整证书链；
+#       Python 不像浏览器会自动补拉缺失的中间证书（AIA），于是在那类机器上报
+#       [VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate。
+# requests 那条路（tableConfig）一直没事，就是因为它本来就用 certifi。实测 certifi 校验
+# games.pragmaticplaylive.net / gs15.pplc001.net 均通过（Amazon 签发）。
+import ssl as _ssl
+import certifi as _certifi
+_WSS_SSL = _ssl.create_default_context(cafile=_certifi.where())
+
+
+async def listen_table(name: str, url: str, min_bet, bet_amount=None):
+    ch_holder = {"ch": name}  # 默认用桌名；subscribe 确认到达后改用服务器给的 channel
+    occupied = {}             # 座位号(str) → 玩家名；非 sit 事件视为起身让位
+    reported = {"init": False}
+    my_seat = {"v": None}     # 我们请求坐下的座位号
+    my_uid = {"v": None}      # 我们自己的 user_id（由坐下确认消息取得）
+    bet = {"pending": None, "last_gid": None, "task": None, "amount": None}
+    #                    待确认的 gameId / 本局已押 / 延时任务 / 本局主注额
+
+    dealer = {"cards": []}    # 庄家已知牌（h0，第一张即明牌），供 EV 使用
+    acted = set()             # 已提交过的 decisionOffer.id（同一条 offer 只动作一次）
+    dec_tasks = {}            # offer.id → 延时动作任务
+    seen_dec = set()          # 已打印过的动作回执（去重）
+    ins = {"done": None}      # 本局保险是否已回应（按 gameId 记）
+
+    shoe = ShoeCounter()      # TC 自算（接管后不再用主程序推的 tc）
+    taken = {"v": False}      # 是否已在 betsopen 接管
+    voip = {"just": False, "detected": False, "after": False, "pending": False}
+
+    async def conn_ticker():
+        """每秒把连接时长刷上板面，到整秒才重画"""
+        shown = -1
+        while True:
+            await asyncio.sleep(0.5)
+            if not conn_clock["running"] or conn_clock["since"] is None:
+                return
+            conn_clock["elapsed"] = time.monotonic() - conn_clock["since"]
+            secs = int(conn_clock["elapsed"])
+            if secs != shown:
+                shown = secs
+                conn_tick()
+                render()
+
+    def report_empty(tag: str):
+        UI["occupy"] = dict(occupied)
+        render()
+        empty = [str(n) for n in range(7) if str(n) not in occupied]
+        shown = ", ".join(seat_disp(n) for n in empty) if empty else "none"
+        log(f"  [💺] {tag} | Free seats: {shown}", Fore.CYAN)
+
+    def report_tc(added=None):
+        UI["shoe_n"] = len(shoe.cards)
+        UI["tc"] = shoe.tc
+        UI["taken"] = True
+        UI["cards"] = [str(c) for c in shoe.cards]
+        render()
+
+    async with websockets.connect(url, ssl=_WSS_SSL if url.startswith("wss") else None) as ws:
+        hb_task = asyncio.create_task(_heartbeat(ws, lambda: ch_holder["ch"]))
+        clock_task = asyncio.create_task(_noop())   # subscribe 确认后换成真正的连接计时任务
+
+        async def initial_report():
+            # 连接后座位重放约 1 秒内推完，等 3 秒作首次空位输出
+            await asyncio.sleep(3)
+            if reported["init"]:
+                return
+            reported["init"] = True
+            report_empty("after connect")
+            empty = [str(n) for n in range(7) if str(n) not in occupied]
+            if not empty:
+                # 满桌不拉黑：只是这桌现在坐不下，断开回去重掷（下轮还可能再抽到它）
+                log("  [🪑] No free seat — disconnecting to re-roll (not blacklisted)", Fore.YELLOW)
+                await ws.close()
+                return
+            seat = random.choice(empty)
+            await ws.send(_sitdown(ch_holder["ch"], seat))
+            my_seat["v"] = seat
+            UI["my_seat"] = seat
+            log(f"  [🪑] Sitting down at seat {seat_disp(seat)}", Fore.CYAN)
+
+        async def place_bet_later(gid):
+            """开局后随机延时 3-5 秒，再提交该局主注（金额 = 用户指定值，未指定才取该桌最低限额）"""
+            await asyncio.sleep(random.uniform(BET_DELAY_MIN, BET_DELAY_MAX))
+            if bet["last_gid"] != gid or my_seat["v"] is None or my_uid["v"] is None:
+                return
+            amt = bet_amount if bet_amount else (min_bet or FALLBACK_BET)
+            try:
+                await ws.send(_lpbet(ch_holder["ch"], gid, my_seat["v"], amt, my_uid["v"]))
+            except Exception:
+                return
+            bet["pending"] = gid
+            bet["amount"] = amt
+            UI["action"] = f"Main bet {amt} sent — awaiting confirm…"
+            log(f"  [💵] Main bet {amt} sent (game {gid} seat {seat_disp(my_seat['v'])}) "
+                f"— awaiting confirm", Fore.YELLOW)
+
+        def schedule_decision(ps: dict):
+            """轮到我：对本局每个「正在活动且带 decisionOffer」的手，排一个延时动作"""
+            gid = str(ps.get("gameId") or "")
+            if not gid or my_uid["v"] is None:
+                return
+            for hkey in sorted(k for k in ps if k.startswith("h") and len(k) == 2):
+                hand = ps.get(hkey)
+                if not isinstance(hand, dict):
+                    continue
+                offer = hand.get("decisionOffer")
+                if not isinstance(offer, dict):
+                    continue
+                # 只有真正轮到我这一手才动作（纯预告帧 activeHand=false 且无 decisionTimer）
+                if not (hand.get("activeHand") is True or "decisionTimer" in hand):
+                    continue
+                oid = str(offer.get("id") or "")
+                if not oid or oid in acted:
+                    continue          # 同一条 offer（含重播）只动作一次
+                acted.add(oid)
+                dec_tasks[oid] = asyncio.create_task(act_later(gid, hkey[1:], hand, offer))
+
+        async def act_later(gid, hand_idx, hand, offer):
+            """轮到我 → 延时 3-5 秒 → EV 程序算最优动作 → 提交"""
+            t0 = time.monotonic()
+            delay = random.uniform(ACTION_DELAY_MIN, ACTION_DELAY_MAX)
+            await asyncio.sleep(delay)
+            if my_seat["v"] is None or my_uid["v"] is None:
+                return
+            if time.monotonic() - t0 > DECISION_WINDOW:
+                log(f"  [⚠️] Decision window passed (>{DECISION_WINDOW}s) — skipping hand {hand_idx}",
+                    Fore.YELLOW)
+                return
+
+            allc = list(shoe.cards)          # 全 shoe 已出牌（feed 基线 + 本地累积）
+            dcards = list(dealer["cards"])   # 庄家已知牌，[0] 为明牌
+            mycards = _hand_cards(hand)      # 我这一手
+            bet_amt = bet["amount"] or bet_amount or min_bet or FALLBACK_BET
+
+            dec, ordered = choose_action(allc, dcards, mycards, offer, bet_amt)
+            if dec is None:
+                return
+
+            try:
+                await ws.send(_decision(ch_holder["ch"], gid, my_uid["v"],
+                                        my_seat["v"], hand_idx, dec))
+            except Exception:
+                return
+            evtxt = " | ".join(f'{x["decision"]} {x["ev"]:+.4f}' for x in ordered)
+            UI["ev"] = evtxt
+            UI["action"] = f"{dec} sent (delay {delay:.1f}s)"
+            log(f"  [▶️] Action {dec} sent (game {gid} seat {seat_disp(my_seat['v'])} "
+                f"hand {hand_disp(hand_idx)}) delay {delay:.1f}s", Fore.CYAN)
+
+        async def send_insurance(gid):
+            """庄家明牌 A：按保险 EV(3p-1) 决定买 / 不买，并回执（买了保额 = 主注一半）"""
+            ev = (calc_ev(list(shoe.cards), ["A"], []) or {}).get("insurance_ev")
+            buy = isinstance(ev, (int, float)) and ev > 0
+            amt = bet_amount if bet_amount else max(1, int(round((bet["amount"] or min_bet or FALLBACK_BET) / 2)))
+            try:
+                await ws.send(_insurance(ch_holder["ch"], gid, my_uid["v"],
+                                         my_seat["v"], buy, amt))
+            except Exception:
+                return
+            log(f"  [🛡️] Insurance {'BUY' if buy else 'DECLINE'} "
+                f"(EV {ev:+.4f}, amount {amt}) — replied",
+                Fore.GREEN if buy else Fore.YELLOW)
+
+        init_task = asyncio.create_task(initial_report())
+        try:
+            confirmed = False
+            async for raw in ws:
+                try:
+                    d = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    d = None
+                if not isinstance(d, dict):
+                    continue
+
+                # ── 下注被拒：平台回执带 seat，是我们座位 → 拉黑该桌、断开重掷 ──
+                if "placebetError" in d or "betValidationError" in d:
+                    key = "placebetError" if "placebetError" in d else "betValidationError"
+                    e = d.get(key) or {}
+                    if my_seat["v"] is not None and str(e.get("seat")) == str(my_seat["v"]):
+                        BLACKLIST.add(name)
+                        log(f"  [⛔] Bet rejected ({key} {e.get('code')}: {e.get('desc', '')}) "
+                            f"— blacklisting table, re-rolling", Fore.RED)
+                        return f"bet rejected ({key} {e.get('code')})"
+                    continue
+
+                # ── 本局结束仍无我们座位的牌 → 判定被拒（兜底） ──
+                if "bjGameEnd" in d:
+                    if bet["pending"] and str((d.get("bjGameEnd") or {}).get("id")) == str(bet["pending"]):
+                        BLACKLIST.add(name)
+                        log(f"  [⛔] Round ended (game {bet['pending']}) with no cards on our seat "
+                            f"— blacklisting table, re-rolling", Fore.RED)
+                        return "round ended with no bet confirmation"
+                    continue
+
+                # ── 开局公告 → 接管点 / 新局 / 换鞋 + 押主注 ──
+                if "betsopen" in d:
+                    gid = str((d.get("betsopen") or {}).get("game") or "")
+                    dealer["cards"] = []   # 新一局：清掉上一局的庄家明牌缓存，免得 EV 用错
+                    # 新一局 → 板面本局区清空、动态区清屏（固定板面不滚屏）
+                    UI["round"] = gid or "—"
+                    UI["scores"] = {}
+                    UI["dealer"] = "—"
+                    UI["me_hands"] = ["", ""]
+                    UI["ev"] = ""
+                    UI["action"] = ""
+                    UI["events"].clear()
+                    render()
+                    # 上一局提交的下注至今无任何确认 → 判定被平台静默拒绝
+                    if bet["pending"] and gid and gid != bet["pending"]:
+                        BLACKLIST.add(name)
+                        log(f"  [⛔] Previous bet (game {bet['pending']}) never confirmed — "
+                            f"treated as rejected, blacklisting table", Fore.RED)
+                        return "previous bet not confirmed"
+                    if not taken["v"]:
+                        snap = snap_map.get(name)
+                        if snap:
+                            shoe.load_baseline(snap.get("cards"))
+                            taken["v"] = True
+                            log(f"  [🧮] TC takeover | baseline {len(shoe.cards)} cards | "
+                                f"feed ts {snap.get('timestamp')}", Fore.MAGENTA)
+                            report_tc()
+                            if feed_ctl["want"]:
+                                feed_pause()   # 基线到手 → 暂停收 feed，之后全靠本地自算
+                                log("  [📴] Baseline received — feed disconnected "
+                                    "(local TC from now, auto re-attach)", Fore.CYAN)
+                        elif TAKEOVER_WITHOUT_BASELINE:
+                            # 没有 feed 基线（粘的桌号不在 table_id.txt）→ 连上即开始算：
+                            # 从这一刻（0 张）起累计，收到洗牌信号照样清零
+                            shoe.clear()
+                            taken["v"] = True
+                            log("  [🧮] No feed baseline — taking over from 0 now "
+                                "(count from here; a shuffle signal will still clear it)",
+                                Fore.MAGENTA)
+                            report_tc()
+                            if feed_ctl["want"]:
+                                feed_pause()
+                                log("  [📴] No snapshot for this table — feed disconnected", Fore.CYAN)
+                        else:
+                            log("  [⏳] No feed snapshot for this table yet — not taking over this round", Fore.YELLOW)
+                    elif (voip["detected"] and voip["after"]) or voip["pending"]:
+                        shoe.clear()
+                        log("  [🔄] Shuffle detected (voip_cc) — shoe cleared, counting from 0", Fore.MAGENTA)
+                        report_tc()
+                    else:
+                        shoe.new_round()
+                    # voip 状态复位（与 PPBJ.py 一致）
+                    voip["just"] = True
+                    voip["detected"] = False
+                    voip["after"] = False
+                    voip["pending"] = False
+                    # 已坐下且本局未押过 → 随机延时 3-5 秒押主注（只押主注）
+                    if gid and my_uid["v"] is not None and gid != bet["last_gid"]:
+                        bet["last_gid"] = gid
+                        bet["task"] = asyncio.create_task(place_bet_later(gid))
+                    continue
+
+                # ── 换鞋准备信号 ──
+                if "voip_cc" in d:
+                    voip["detected"] = True
+                    if voip["just"]:
+                        voip["pending"] = True
+                        voip["just"] = False
+                    continue
+
+                # ── 保险邀请（庄家明牌 A）→ 按 EV 决定买/不买并回执，每局一次 ──
+                if "notinsured" in d:
+                    ni = d.get("notinsured") or {}
+                    gid = bet["last_gid"]
+                    log(f"  [🛡️] Insurance offer (seat {seat_disp(ni.get('seat'))} "
+                        f"auto={ni.get('auto')}) game {gid}", Fore.CYAN)
+                    if (gid and my_uid["v"] is not None and my_seat["v"] is not None
+                            and bet["amount"] and ins["done"] != gid):
+                        ins["done"] = gid
+                        await send_insurance(gid)
+                    continue
+
+                # ── 发牌 → 自己扣牌、自己算 TC + 下注确认 + 轮到我则算 EV 出动作 ──
+                if "playerSeat" in d:
+                    ps = d.get("playerSeat") or {}
+                    seat_no = ps.get("seatNumber")
+                    # 庄家帧（seatNumber=-1）：记下已知牌，第一张即明牌，供 EV 使用
+                    if seat_no == -1:
+                        h0 = ps.get("h0") or {}
+                        dcs = _hand_cards(h0)
+                        dealer["cards"] = dcs
+                        if h0.get("score"):
+                            UI["dealer"] = (f"{h0['score']} ( {' '.join(dcs)} )"
+                                            if dcs else str(h0["score"]))
+                    else:
+                        # 各座位点数 → 板面（本局进行中逐张刷新）
+                        sk = str(seat_no)
+                        for hk in (k for k in ps if k.startswith("h") and len(k) == 2):
+                            hh = ps.get(hk)
+                            if isinstance(hh, dict) and hh.get("score"):
+                                UI["scores"][sk] = str(hh["score"])
+                    if voip["detected"]:
+                        voip["after"] = True
+                    if taken["v"]:
+                        added = shoe.feed_player_seat(ps)
+                        if added:
+                            report_tc(added)
+                    # 下注确认：本局我们座位真实拿到牌
+                    if (bet["pending"] and str(ps.get("gameId")) == str(bet["pending"])
+                            and my_seat["v"] is not None
+                            and str(seat_no) == str(my_seat["v"])):
+                        log(f"  [✅] Bet confirmed (game {bet['pending']} "
+                            f"seat {seat_disp(my_seat['v'])} got cards)", Fore.GREEN)
+                        bet["pending"] = None
+                    # 我们座位：轮到我 → 排动作；并打印动作回执（服务器确认我们这手做了什么）
+                    if my_seat["v"] is not None and str(seat_no) == str(my_seat["v"]):
+                        schedule_decision(ps)
+                        for hkey in sorted(k for k in ps if k.startswith("h") and len(k) == 2):
+                            hh = ps.get(hkey)
+                            if not isinstance(hh, dict):
+                                continue
+                            cs = _hand_cards(hh)
+                            slot = int(hkey[1:]) if hkey[1:].isdigit() else -1   # 协议手号 0/1 → 板面 hand1 / hand2
+                            if cs and 0 <= slot < len(UI["me_hands"]):
+                                UI["me_hands"][slot] = f"{hh.get('score', '?')} ( {' '.join(cs)} )"
+                            cd = hh.get("currentDecision")
+                            if (hh.get("currentDecisionAction") in ("playerDecision", "systemCall")
+                                    and cd):
+                                sig = (str(ps.get("gameId")), hkey, cd,
+                                       len(hh.get("cards") or []))
+                                if sig not in seen_dec:
+                                    seen_dec.add(sig)
+                                    UI["action"] = (f"{cd} confirmed by server "
+                                                    f"(hand {hand_disp(hkey[1:])})")
+                                    log(f"  [✅] Action confirmed: {cd} "
+                                        f"(hand {hand_disp(hkey[1:])})", Fore.GREEN)
+                        render()
+                    continue
+
+                # ── 座位消息 → 按座位号记账 ──
+                if "seat" in d:
+                    s = d.get("seat") or {}
+                    num = str(s.get("num"))
+                    ev = s.get("event")
+                    if ev == "sit":
+                        occupied[num] = s.get("screen_name", "")
+                        UI["occupy"][num] = s.get("screen_name", "")
+                        # 我们坐下的那个位子 → 记下自己的 user_id
+                        if my_uid["v"] is None and num == my_seat["v"]:
+                            my_uid["v"] = s.get("user_id")
+                            log(f"  [✅] Seat confirmed: {seat_disp(num)} "
+                                f"(user_id={my_uid['v']})", Fore.GREEN)
+                    elif ev == "stand":
+                        occupied.pop(num, None)
+                        UI["occupy"].pop(num, None)
+                        UI["scores"].pop(num, None)
+                        # 我们因久坐未下注被服务器请出 → 断开，回去重新掷骰选桌（不拉黑）
+                        if s.get("type") == "timeout" and s.get("user_id") == my_uid["v"]:
+                            log("  [⛔] Kicked from seat by server (stand/timeout) — re-rolling",
+                                Fore.RED)
+                            return
+                    continue
+
+                # ── subscribe 确认 → 记录服务器 channel，立即发首条心跳，并开始计连接时长 ──
+                if not confirmed and "subscribe" in d:
+                    ch = (d.get("subscribe") or {}).get("channel")
+                    if ch:
+                        ch_holder["ch"] = ch
+                        confirmed = True
+                        log(f"  [🔗] subscribe confirmed, channel={ch}", Fore.GREEN)
+                        conn_start()      # 真正连上这张桌 → 开始计时（面板 Connected: HH:MM:SS）
+                        clock_task.cancel()
+                        clock_task = asyncio.create_task(conn_ticker())
+                        await ws.send(_ping(ch))
+        except websockets.ConnectionClosed:
+            pass
+        finally:
+            conn_stop()               # 定格最终连接时长（面板上保留下来）
+            clock_task.cancel()
+            hb_task.cancel()
+            init_task.cancel()
+            if bet["task"]:
+                bet["task"].cancel()
+            for t in dec_tasks.values():
+                t.cancel()
+        return None
+
+
+def _ping(channel: str) -> str:
+    return f'<ping channel="{channel}" time="{int(time.time() * 1000)}"/>'
+
+
+def _sitdown(channel: str, seat: str) -> str:
+    return (f'<command channel="{channel}">'
+            f'<sitdown gameMode="blackjack_desktop" seatNum="{seat}"></sitdown>'
+            f'</command>')
+
+
+def _lpbet(channel: str, gid, seat, amount: int, user_id: str) -> str:
+    """下注主注（只押主注，其余玩法一律 false）—— 格式取自实测抓包 bet_test_log.txt"""
+    ck = str(int(time.time() * 1000))
+    return (f'<command channel="{channel}">'
+            f'<lpbet gameMode="blackjack_desktop" gameId="{gid}" userId="{user_id}" ck="{ck}">'
+            f'<bet seat="{seat}" amount="{amount}" mainbet="true" bj21plus3="false" '
+            f'perfectpair="false" betbehind="false" ck="{ck}"/>'
+            f'</lpbet></command>')
+
+
+# EV 动作名 → 协议 dec 值（注意 cashOut 是驼峰，其余全小写）
+DEC_MAP = {"Hit": "hit", "Stand": "stand", "Double": "double",
+           "Split": "split", "CashOut": "cashOut"}
+
+
+def choose_action(all_cards, dealer_cards, player_cards, offer, bet_amount):
+    """
+    把这一手原样交给 PP EV.py 算最优动作（含 cashOut），再按服务器白名单过滤。
+    不做任何自加的额外判据 —— 兑现价怎么算、算出来排第几，全按 PP EV.py 的公式。
+    返回 (dec, ordered)：dec 为协议值（None = 无可用动作），ordered 为 EV 降序候选。
+    """
+    # 提前兑现：服务器给了就原样交进去，由 EV.py 自己的公式（cash_out ÷ 主注 − 1）参与排名
+    co = None
+    raw = offer.get("cashOut")
+    if USE_CASHOUT and isinstance(raw, (int, float)):
+        co = float(raw)
+
+    r = calc_ev(all_cards, dealer_cards, player_cards, cash_out=co, bet_amount=bet_amount)
+    ordered = r.get("all_decisions") or []
+
+    # 服务器白名单：hit / stand 永远可发；double / split / cashOut 需被允许
+    allow = {"Hit": True, "Stand": True,
+             "Double": bool(offer.get("canDouble")),
+             "Split": bool(offer.get("canSplit")),
+             "CashOut": co is not None}
+    pick = next((x for x in ordered if allow.get(x["decision"])), None)
+    return (DEC_MAP[pick["decision"]] if pick else None), ordered
+
+
+def _decision(channel: str, gid, user_id: str, seat, hand, dec: str) -> str:
+    """提交动作 —— 格式取自实测抓包：<decision ... seatNum hand dec>（不需要 decisionOffer.id）"""
+    ck = str(int(time.time() * 1000))
+    return (f'<command channel="{channel}">'
+            f'<decision gameMode="blackjack_desktop" gameId="{gid}" userId="{user_id}" '
+            f'ck="{ck}" seatNum="{seat}" hand="{hand}" dec="{dec}"></decision>'
+            f'</command>')
+
+
+def _insurance(channel: str, gid, user_id: str, seat, buy: bool, amount: int) -> str:
+    """保险回执：choice=y 买 / n 不买，amount 为保额 —— 格式取自实测抓包"""
+    ck = str(int(time.time() * 1000))
+    return (f'<command channel="{channel}">'
+            f'<insurance gameMode="blackjack_desktop" gameId="{gid}" userId="{user_id}" '
+            f'ck="{ck}" >'
+            f'<bet choice="{"y" if buy else "n"}" seatNum="{seat}" betBehind="false" '
+            f'amount="{amount}" /></insurance></command>')
+
+
+async def _heartbeat(ws, get_channel):
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+        try:
+            await ws.send(_ping(get_channel()))
+        except Exception:
+            return
+
+
+async def _noop():
+    """占位任务：连接计时任务在 subscribe 确认时才真正启动（见 listen_table）"""
+    return
+
+
+# ═══════════════════════ 主流程 ═══════════════════════
+async def main():
+    print("=" * 46)
+    print("  PP AutoBot (login · table pick · connect · heartbeat · EV decisions)")
+    print("=" * 46)
+
+    tables = load_tables()
+    log(f"  [📋] {len(tables)} table mappings loaded (table_id.txt)")
+    tables_by_id = {v: k for k, v in tables.items()}   # 桌号 → 桌名（直连模式下反查显示名）
+
+    # 启动即走「粘贴完整 wss URL」；URL 在这里读完，避免与后面的异步日志交错
+    log("  [👤] Login: pasted URL", Fore.CYAN)
+    UI["login"] = "pasted URL"
+    pasted_sid, pasted_tid = ask_pasted_jsid()
+    bet_amount = ask_bet_amount()      # 固定注额；None = 用该桌最低限额
+
+    if USE_FEED:
+        feed = asyncio.create_task(feed_task())
+    else:
+        feed = None
+        log("  [📴] 网络端(feed) 已停用 (USE_FEED=False) — 不连 pp.knewb2u.com；"
+            "连上桌后直接无基线接管，TC 从 0 起算", Fore.CYAN)
+
+    sid = pasted_sid
+    build_fails = 0
+    asyncio.create_task(balance_task(sid))   # 余额轮询：面板常驻显示
+
+    while True:
+        # 需要新基线 → 把 TC 数据源接回来；旧快照清掉（防止拿上一次的旧账当新基线）
+        feed_ctl["want"] = USE_FEED     # 停用网络端时保持关闭，永不重连
+        snap_map.clear()
+        tc_map.clear()
+        if USE_PASTED_TABLE:
+            # 直连模式：粘贴 URL 里是哪个 tableId 就连那张，掷骰选桌整段跳过
+            table_id = pasted_tid
+            name = tables_by_id.get(table_id, table_id)
+            if name == table_id:
+                log(f"  [📌] Direct mode: tableId {table_id} (from pasted URL) — "
+                    f"dice roll skipped | 不在 table_id.txt → 没有该桌的外部 TC 快照", Fore.CYAN)
+            else:
+                log(f"  [📌] Direct mode: {name} (id {table_id}) from pasted URL — "
+                    f"dice roll skipped", Fore.CYAN)
+        else:
+            name = await pick_table(tables)
+            table_id = tables[name]
+        try:
+            url, min_bet = await asyncio.to_thread(build_ws_url, sid, table_id)
+            build_fails = 0
+        except Exception as e:
+            log(f"  [❌] Failed to build {name}: {e} — "
+                f"{'retrying the same table (direct mode)' if USE_PASTED_TABLE else 'picking another table'}",
+                Fore.RED)
+            build_fails += 1
+            if USE_PASTED_TABLE and build_fails >= 3:
+                # 直连模式没有「换桌」可退，连续失败基本只有一种原因：JSESSIONID 过期
+                log("  [🔁] Still failing in direct mode — paste a new URL:", Fore.YELLOW)
+                pasted_sid, pasted_tid = ask_pasted_jsid()
+                sid = pasted_sid
+                build_fails = 0
+                continue
+            await asyncio.sleep(3)
+            continue
+
+        # 板面：新一桌信息 + 重置本局/牌靴区
+        UI["active"] = True
+        UI["table"] = name
+        UI["min_bet"] = min_bet
+        UI["my_seat"] = None
+        UI["taken"] = False
+        UI["stopped"] = ""            # 新一轮连接 → 清掉上一次的停止标记
+        UI["shoe_n"] = 0
+        UI["tc"] = 0.0
+        UI["cards"] = []
+        UI["scores"] = {}
+        UI["occupy"] = {}
+        UI["me_hands"] = ["", ""]
+        UI["ev"] = ""
+        UI["action"] = ""
+        UI["conn_secs"] = 0.0
+        conn_reset()                  # 连接时长归零，等 subscribe 确认后开始计
+        render()
+
+        log(f"  [🔌] Connecting to {name} ... (min bet {min_bet or FALLBACK_BET}, "
+            f"our bet {bet_amount or 'auto=min'})", Fore.CYAN)
+        stopped_reason = ""
+        try:
+            reason = await listen_table(name, url, min_bet, bet_amount)
+            if reason:
+                log(f"  [↩️] {name}: {reason} — re-rolling in {RECONNECT_WAIT}s", Fore.YELLOW)
+        except websockets.ConnectionClosed:
+            # 非主动断开（网络断 / 被服务器踢）—— 主动断开走的是 reason 那条路，不是这里
+            stopped_reason = "connection closed"
+            log(f"  [⛔] {name} connection closed", Fore.RED)
+        except Exception as e:
+            stopped_reason = f"disconnected ({e})"
+            log(f"  [⛔] {name} disconnected: {e}", Fore.RED)
+
+        if stopped_reason and STOP_ON_DISCONNECT:
+            conn_stop()
+            UI["stopped"] = stopped_reason
+            UI["action"] = f"STOPPED — {stopped_reason} (窗口保留，程序未退出)"
+            log("  [🛑] Program STOPPED — 窗口保留，不再自动重连。"
+                " 关掉这个窗口即退出。", Fore.RED)
+            render()
+            await asyncio.Event().wait()      # 永久挂起：不退出程序，窗口留着让你看到原因
+            return
+
+        await asyncio.sleep(RECONNECT_WAIT)
+
+        # 直连模式下只有这一张桌：它一旦被拉黑（下注被拒），重连它没意义 → 重新粘贴 URL
+        if USE_PASTED_TABLE and name in BLACKLIST:
+            log("  [🔁] Table blacklisted (bet rejected) — paste a new URL "
+                "(换新 URL 会清空黑名单):", Fore.YELLOW)
+            pasted_sid, pasted_tid = ask_pasted_jsid()
+            sid = pasted_sid
+            BLACKLIST.clear()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[👋] Exited")
