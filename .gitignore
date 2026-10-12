@@ -28,3 +28,6 @@ dist/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# ---- WorkBuddy 工作区记忆 ----
+.workbuddy/
