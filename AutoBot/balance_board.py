@@ -6,9 +6,11 @@ balance_board.py — 多客户端余额汇总看板（零依赖，只用 Python 
 用途：程序会在多台 VPS 上跑，这个服务集中收各个客户端的余额，
       老板用浏览器打开就能看到每台的钱、今日盈亏、在跑哪张桌、还活着没。
 
-命名：客户端会上报一个「机器指纹」(machine_id)；服务端按首次上报的先后自动发号
-      VPS-1 / VPS-2 / VPS-3 …（同指纹永远同一个号）→ 每台 VPS 什么都不用配。
+命名：默认用「上报请求的来源 IP」当显示名（每台 VPS 什么都不用配）。
+      若来源 IP 不可用（本地回环 / 内网 / 反代后丢失），退回按「机器指纹」(machine_id)
+      自动发号 VPS-1 / VPS-2 …（同指纹永远同一个号）。
       若客户端手填了 client_id，则以其为准（旧行为，可回滚）。
+      切回旧行为：把下面 NAME_MODE 改成 "seq"。
 
 跑法（在那台常开的服务器上）：
     python3 balance_board.py              # 默认 0.0.0.0:8899
@@ -44,6 +46,10 @@ HEARTBEAT_HINT = 30             # 客户端心跳间隔（仅用于页面提示�
 #           充值 / 提现会被当成盈亏算进去 → 数字不准，索性不显示
 #   True  = 恢复显示（列 + 顶部合计）
 SHOW_PNL = False
+# 命名方式
+#   "ip"  = 用上报请求的来源 IP 当显示名（默认）—— IP 变了名字会跟着变，旧行会留「掉线」
+#   "seq" = 退回旧行为：按机器指纹自动发号 VPS-1 / VPS-2 …（名字稳定，但看不出是哪台机）
+NAME_MODE = "ip"
 TZ = timezone(timedelta(hours=8))   # 看板按马来西亚时间分「天」（当日盈亏）
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -92,6 +98,17 @@ def _save():
 
 
 # ── 自动发号：机器指纹 → VPS-N（按首次上报的先后；同指纹永远同一个号）──
+# 仅在 NAME_MODE="seq"，或来源 IP 不可用时作为兜底使用
+_BAD_IP_RE = re.compile(
+    r"^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|0\.0\.0\.0$|::1$)"
+)
+
+
+def _ip_ok(ip: str) -> bool:
+    """来源 IP 能不能拿来当名字：空值 / 回环 / 内网 / 链路本地 都不行（会一堆机器撞名）"""
+    return bool(ip) and not _BAD_IP_RE.match(ip)
+
+
 def _assign_name(mid: str) -> str:
     used = set(_machines.values())
     n = 1
@@ -103,16 +120,19 @@ def _assign_name(mid: str) -> str:
     return name
 
 
-def _resolve_name(p: dict) -> str:
+def _resolve_name(p: dict, ip: str = "") -> str:
     """
     决定这条上报在看板上叫什么：
       1. 手填了 client_id → 直接用（旧行为，可回滚）
-      2. 没填但有 machine_id → 按指纹查号；没见过就发下一个（VPS-1 / VPS-2 …）
-      3. 两者都没有 → 返回 ""（调用方按 400 拒掉）
+      2. NAME_MODE="ip" 且来源 IP 可用 → 用 IP 当名字
+      3. 否则按 machine_id 查号；没见过就发下一个（VPS-1 / VPS-2 …）
+      4. 都没有 → 返回 ""（调用方按 400 拒掉）
     """
     cid = str(p.get("client_id") or "").strip()
     if cid:
         return cid
+    if NAME_MODE == "ip" and _ip_ok(ip):
+        return ip
     mid = str(p.get("machine_id") or "").strip()
     if not mid:
         return ""
@@ -183,10 +203,16 @@ def _snapshot():
         if SHOW_PNL:
             row["pnl"] = r.get("pnl")
         rows.append(row)
-    # 自然排序：VPS-1 / VPS-2 / … / VPS-10（而不是 VPS-1、VPS-10、VPS-2）
+    # 排序：VPS-1 / VPS-2 … ；IP 按数字段（10.0.0.2 在 10.0.0.10 前）；其余按名
     def _sk(r):
-        m = re.match(r"^vps-(\d+)$", r["client_id"].lower())
-        return (0, int(m.group(1)), "") if m else (1, 0, r["client_id"].lower())
+        c = r["client_id"]
+        m = re.match(r"^vps-(\d+)$", c.lower())
+        if m:
+            return (0, (int(m.group(1)),), "")
+        ip = re.match(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$", c)
+        if ip:
+            return (1, tuple(int(g) for g in ip.groups()), "")
+        return (2, (0, 0, 0, 0), c.lower())
     rows.sort(key=_sk)
     online = [x for x in rows if x["online"]]
     # 按币种分组合计（不同币种不能相加，分开统计）
@@ -404,7 +430,7 @@ class Handler(BaseHTTPRequestHandler):
             print(f"[board] 拒绝：token 不符  from {self.client_address[0]}")
             return
 
-        cid = _resolve_name(p)
+        cid = _resolve_name(p, self.client_address[0])
         if not cid or len(cid) > 64:
             self._json(400, {"ok": False, "error": "bad client_id"})
             return
