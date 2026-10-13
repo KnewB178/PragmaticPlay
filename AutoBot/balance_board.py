@@ -189,6 +189,14 @@ def _snapshot():
         return (0, int(m.group(1)), "") if m else (1, 0, r["client_id"].lower())
     rows.sort(key=_sk)
     online = [x for x in rows if x["online"]]
+    # 按币种分组合计（不同币种不能相加，分开统计）
+    totals, pnl_totals = {}, {}
+    for x in online:
+        cur = (x.get("currency") or "").strip().upper() or "—"
+        if x["balance"] is not None:
+            totals[cur] = totals.get(cur, 0.0) + x["balance"]
+        if SHOW_PNL and x.get("pnl") is not None:
+            pnl_totals[cur] = pnl_totals.get(cur, 0.0) + x["pnl"]
     out = {
         "now": datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
         "offline_after": OFFLINE_AFTER,
@@ -197,11 +205,13 @@ def _snapshot():
         "online": len(online),
         "total": round(sum(x["balance"] for x in online if x["balance"] is not None), 2),
         "currency": next((x["currency"] for x in rows if x["currency"]), ""),
+        "totals": {k: round(v, 2) for k, v in sorted(totals.items())},
         "clients": rows,
         "show_pnl": SHOW_PNL,
     }
     if SHOW_PNL:
         out["pnl_total"] = round(sum(x["pnl"] for x in online if x["pnl"] is not None), 2)
+        out["pnl_totals"] = {k: round(v, 2) for k, v in sorted(pnl_totals.items())}
     return out
 
 
@@ -288,6 +298,10 @@ function ago(a){
   if(a < 3600) return Math.floor(a/60) + ' 分钟前';
   return Math.floor(a/3600) + ' 小时前';
 }
+function curLines(t, f){
+  const es = Object.entries(t || {});
+  return es.length ? es.map(([c,v]) => f(v) + ' ' + c).join('<br>') : '—';
+}
 async function tick(){
   try{
     const r = await fetch('/api/clients', {cache:'no-store'});
@@ -295,12 +309,14 @@ async function tick(){
     document.getElementById('sub').textContent =
       d.now + ' · 每 ' + d.heartbeat + ' 秒心跳，超过 ' + d.offline_after + ' 秒没上报即标红';
     document.getElementById('c_on').textContent = d.online + ' / ' + d.count;
-    document.getElementById('c_total').textContent = fmt(d.total) + ' ' + (d.currency || '');
+    document.getElementById('c_total').innerHTML = curLines(d.totals, fmt);
     document.body.classList.toggle('hide-pnl', !d.show_pnl);
     if(d.show_pnl){
       const pe = document.getElementById('c_pnl');
-      pe.textContent = pnlTxt(d.pnl_total) + ' ' + (d.currency || '');
-      pe.className = 'v ' + pnlCls(d.pnl_total);
+      pe.innerHTML = curLines(d.pnl_totals, pnlTxt);
+      const es = Object.entries(d.pnl_totals || {});
+      const pos = es.some(([,v]) => v > 0), neg = es.some(([,v]) => v < 0);
+      pe.className = 'v ' + (pos && !neg ? 'up' : neg && !pos ? 'down' : '');
     }
 
     const COLS = d.show_pnl ? 7 : 6;
