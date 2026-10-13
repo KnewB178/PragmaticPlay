@@ -13,6 +13,8 @@ envs/
 # ---- PyInstaller 构建产物 ----
 build/
 dist/
+build_test/
+dist_test/
 *.spec
 !requirements.txt
 
