@@ -6,6 +6,10 @@ balance_board.py — 多客户端余额汇总看板（零依赖，只用 Python 
 用途：程序会在多台 VPS 上跑，这个服务集中收各个客户端的余额，
       老板用浏览器打开就能看到每台的钱、今日盈亏、在跑哪张桌、还活着没。
 
+命名：客户端会上报一个「机器指纹」(machine_id)；服务端按首次上报的先后自动发号
+      VPS-1 / VPS-2 / VPS-3 …（同指纹永远同一个号）→ 每台 VPS 什么都不用配。
+      若客户端手填了 client_id，则以其为准（旧行为，可回滚）。
+
 跑法（在那台常开的服务器上）：
     python3 balance_board.py              # 默认 0.0.0.0:8899
     python3 balance_board.py 9000         # 换端口
@@ -22,6 +26,7 @@ balance_board.py — 多客户端余额汇总看板（零依赖，只用 Python 
 import hmac
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -46,7 +51,8 @@ STATE_FILE = os.path.join(HERE, "balance_state.json")
 
 # ══════════════════════════ 数据 ══════════════════════════
 _lock = threading.Lock()
-_clients = {}   # client_id -> {balance, currency, table, status, reason, ts, day, open, pnl}
+_clients = {}    # 显示名 -> {balance, currency, table, status, reason, ts, day, open, pnl}
+_machines = {}   # machine_id（机器指纹）-> 显示名「VPS-N」，按首次上报的先后发号
 ORDER_LOCK = threading.Lock()
 
 
@@ -55,13 +61,19 @@ def _today():
 
 
 def _load():
-    global _clients
+    global _clients, _machines
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
-            _clients = data
-            print(f"[board] 载入 {len(_clients)} 个客户端的历史余额")
+            if "clients" in data or "machines" in data:
+                # 新格式：{clients:{…}, machines:{指纹 -> VPS-N}}
+                _clients = data.get("clients") or {}
+                _machines = data.get("machines") or {}
+            else:
+                # 旧格式（只有客户端表）：照读，指纹表从空开始
+                _clients = data
+            print(f"[board] 载入 {len(_clients)} 个客户端、{len(_machines)} 台机器指纹")
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -72,10 +84,44 @@ def _save():
     tmp = STATE_FILE + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(_clients, f, ensure_ascii=False, indent=2)
+            json.dump({"clients": _clients, "machines": _machines}, f,
+                      ensure_ascii=False, indent=2)
         os.replace(tmp, STATE_FILE)
     except Exception as e:
         print(f"[board] 落盘失败（忽略）: {e}")
+
+
+# ── 自动发号：机器指纹 → VPS-N（按首次上报的先后；同指纹永远同一个号）──
+def _assign_name(mid: str) -> str:
+    used = set(_machines.values())
+    n = 1
+    while f"VPS-{n}" in used:
+        n += 1
+    name = f"VPS-{n}"
+    _machines[mid] = name
+    print(f"[board] 新机器 {mid} → {name}")
+    return name
+
+
+def _resolve_name(p: dict) -> str:
+    """
+    决定这条上报在看板上叫什么：
+      1. 手填了 client_id → 直接用（旧行为，可回滚）
+      2. 没填但有 machine_id → 按指纹查号；没见过就发下一个（VPS-1 / VPS-2 …）
+      3. 两者都没有 → 返回 ""（调用方按 400 拒掉）
+    """
+    cid = str(p.get("client_id") or "").strip()
+    if cid:
+        return cid
+    mid = str(p.get("machine_id") or "").strip()
+    if not mid:
+        return ""
+    with _lock:
+        name = _machines.get(mid)
+        if name is None:
+            name = _assign_name(mid)
+            _save()          # 立刻落盘，免得刚发的号因下次重启而丢
+    return name
 
 
 def _update(cid, p):
@@ -137,7 +183,11 @@ def _snapshot():
         if SHOW_PNL:
             row["pnl"] = r.get("pnl")
         rows.append(row)
-    rows.sort(key=lambda x: x["client_id"].lower())
+    # 自然排序：VPS-1 / VPS-2 / … / VPS-10（而不是 VPS-1、VPS-10、VPS-2）
+    def _sk(r):
+        m = re.match(r"^vps-(\d+)$", r["client_id"].lower())
+        return (0, int(m.group(1)), "") if m else (1, 0, r["client_id"].lower())
+    rows.sort(key=_sk)
     online = [x for x in rows if x["online"]]
     out = {
         "now": datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
@@ -338,7 +388,7 @@ class Handler(BaseHTTPRequestHandler):
             print(f"[board] 拒绝：token 不符  from {self.client_address[0]}")
             return
 
-        cid = str(p.get("client_id") or "").strip()
+        cid = _resolve_name(p)
         if not cid or len(cid) > 64:
             self._json(400, {"ok": False, "error": "bad client_id"})
             return
