@@ -245,10 +245,10 @@ FEED_URL = _cfg["bot"].get("feed_url", "ws://pp.knewb2u.com:8888/ws").strip()
 
 def _load_report_cfg():
     """
-    上报配置（client_id / report_url / report_token）。
-    ★ exe 版优先读「exe 旁边那份 bot_config.ini」——每台 VPS 才能各报各的名字；
+    上报配置（client_id / report_url / report_token / sheet_url）。
+    ★ exe 版优先读「exe 旁边那份 bot_config.ini」——每台 VPS 才能各改各的；
       读不到才退回打包进 exe 的那份。
-    返回 (client_id, report_url, report_token, 来源说明)
+    返回 (client_id, report_url, report_token, sheet_url, 来源说明)
     """
     cands = []
     if _FROZEN:
@@ -259,15 +259,18 @@ def _load_report_cfg():
             c = configparser.ConfigParser()
             if not c.read(p, encoding="utf-8") or "bot" not in c:
                 continue
-            cid = c["bot"].get("client_id", "").strip()
-            if cid:
-                return (cid, c["bot"].get("report_url", "").strip(),
-                        c["bot"].get("report_token", "").strip(), str(p))
+            b = c["bot"]
+            return (b.get("client_id", "").strip(),
+                    b.get("report_url", "").strip(),
+                    b.get("report_token", "").strip(),
+                    b.get("sheet_url", "").strip(),
+                    str(p))
         except Exception:
             continue
-    cid = _cfg["bot"].get("client_id", "").strip() if "bot" in _cfg else ""
-    return (cid, _cfg["bot"].get("report_url", "").strip() if "bot" in _cfg else "",
+    return (_cfg["bot"].get("client_id", "").strip() if "bot" in _cfg else "",
+            _cfg["bot"].get("report_url", "").strip() if "bot" in _cfg else "",
             _cfg["bot"].get("report_token", "").strip() if "bot" in _cfg else "",
+            _cfg["bot"].get("sheet_url", "").strip() if "bot" in _cfg else "",
             "bundled")
 
 
@@ -286,7 +289,7 @@ def _machine_fingerprint() -> str:
     return "M-" + hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()[:10].upper()
 
 
-CLIENT_ID, REPORT_URL, REPORT_TOKEN, REPORT_CFG_SRC = _load_report_cfg()
+CLIENT_ID, REPORT_URL, REPORT_TOKEN, SHEET_URL, REPORT_CFG_SRC = _load_report_cfg()
 # 自动机器指纹：上报时一起发出去，服务端靠它认出「同一台」并自动发号 VPS-1 / VPS-2 …
 # （手填了 client_id 的话以填的为准 → 保留旧行为，可随时回滚）
 MACHINE_ID = _machine_fingerprint()
@@ -391,6 +394,18 @@ EVENTS_ROWS = 8          # 「Recent events」固定占几行（不足补空行 
 REPORT_ENABLED = True
 REPORT_HEARTBEAT = 30    # 余额没变时的心跳间隔（秒）
 REPORT_TIMEOUT = 3       # 单次上报超时（秒）
+# ─────────────────────────────────────────────────────────────
+
+# ── 余额也推一份到 Google 表格（照 EVO / EGBJ 的做法）──
+#     EVO 那边是每台机自己把 {machine_id, balance} POST 到那张表的 doPost，
+#     由 doPost 按名字找行、更新/追加 → 写进 live 页。这里做同一件事：
+#     同地址、同格式，PP 的余额就跟 EVO 汇进同一张表（live 页）。
+#     · 缺 sheet_url = 自动停用（不产生任何请求，等同关闭）
+#     · 只在「余额变化」时推（跟 EVO 一致，没变不推 → 尽量省 Google 配额）
+#     · 后台线程、超时 SHEET_TIMEOUT 秒、静默失败、不重试 → 绝不拖慢下注
+SHEET_TIMEOUT = 5        # 单次推送超时（秒）—— 跟 EVO 的 send_balance_async 一致
+SHEET_ID_PREFIX = "PP-"  # 名字前缀：EVO 用纯 IP，这里加 PP- 免得同机跑 EVO 时撞名
+                         # （改空字符串 "" 即与 EVO 完全一致 = 纯 IP）
 # ─────────────────────────────────────────────────────────────
 
 tc_map = {}    # 桌名 → 最新 TC（主程序推的）
@@ -898,6 +913,63 @@ def report_status(status: str, reason: str = ""):
         pass
 
 
+# ─────────────────────── ⓪d 余额推送到 Google 表格（照 EVO 那套）───────────────────────
+# EVO 的 EGBJ/BJ.py 里：
+#   · get_machine_id()      → 取本机出口 IP（UDP 连 8.8.8.8）当机器名
+#   · send_balance_async()  → 余额一变就把 {machine_id, balance} POST 到那张表的 doPost
+# 这里完全照做，只是把目的地写在 bot_config.ini 的 sheet_url（缺 = 不启用）。
+_sheet_ctl = {"last_bal": object()}   # 用 object() 占位，保证第一次一定会推
+
+
+def _outbound_ip() -> str:
+    """出口 IP —— 跟 EVO 的 get_machine_id() 同一套做法（UDP 连 8.8.8.8 看走哪张网卡）"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.settimeout(2)
+            s.connect(("8.8.8.8", 53))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except Exception:
+        return MACHINE_ID          # 取不到就退回机器指纹（一定不为空）
+
+
+_sheet_mid_cache = None
+
+
+def _sheet_machine_id() -> str:
+    global _sheet_mid_cache
+    if _sheet_mid_cache is None:
+        _sheet_mid_cache = SHEET_ID_PREFIX + _outbound_ip()
+    return _sheet_mid_cache
+
+
+def _post_sheet(bal):
+    """后台线程推送：短超时、静默失败、绝不重试（与 EVO 的 send_balance_async 行为一致）"""
+    payload = {"machine_id": _sheet_machine_id(), "balance": float(bal)}
+
+    def _run():
+        try:
+            requests.post(SHEET_URL, json=payload, timeout=SHEET_TIMEOUT)
+        except Exception:
+            pass
+    try:
+        threading.Thread(target=_run, daemon=True).start()
+    except Exception:
+        pass
+
+
+def maybe_push_sheet(num):
+    """余额一变就推（跟 EVO 一样；没变就不推，省 Google 配额）"""
+    if not SHEET_URL or num is None:
+        return
+    if num == _sheet_ctl["last_bal"]:
+        return
+    _sheet_ctl["last_bal"] = num
+    _post_sheet(num)
+
+
 async def balance_task(sid: str):
     """定时轮询余额 → 面板常驻显示 + 上下限检查；数值没变就不重画（避免无谓刷屏）"""
     while True:
@@ -910,6 +982,7 @@ async def balance_task(sid: str):
                 render()
             _check_balance_limit(num)
             maybe_report_balance(num)          # 余额上报（后台线程，不阻塞）
+            maybe_push_sheet(num)              # 余额推 Google 表格（照 EVO；后台线程，不阻塞）
         await asyncio.sleep(BALANCE_INTERVAL)
 
 
