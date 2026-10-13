@@ -22,6 +22,7 @@ PP 自动程序（Python 版 · 新建文件夹，不修改原文件夹任何文
 """
 
 import os, sys, json, time, random, asyncio, configparser, importlib.util, unicodedata
+import hashlib, socket, uuid          # 机器指纹：自动区分「这是哪一台 VPS」
 import threading
 import traceback
 from pathlib import Path
@@ -270,7 +271,25 @@ def _load_report_cfg():
             "bundled")
 
 
+def _machine_fingerprint() -> str:
+    """
+    自动机器指纹 —— 主机名 + 网卡 MAC 的哈希。
+
+    作用：不用手填 client_id，程序也认得出「这是哪一台」。
+    · 同一台机器每次开机算出来都一样（换目录 / 重启 / 重打包都不变）→ 服务端永远认它是同一台。
+    · 换网卡 / 重装系统 → 指纹会变，服务端会当成新机器发新号（旧号那行就变「掉线」）。
+    """
+    try:
+        raw = f"{socket.gethostname()}|{uuid.getnode():012x}"
+    except Exception:
+        raw = socket.gethostname() or "unknown-host"
+    return "M-" + hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()[:10].upper()
+
+
 CLIENT_ID, REPORT_URL, REPORT_TOKEN, REPORT_CFG_SRC = _load_report_cfg()
+# 自动机器指纹：上报时一起发出去，服务端靠它认出「同一台」并自动发号 VPS-1 / VPS-2 …
+# （手填了 client_id 的话以填的为准 → 保留旧行为，可随时回滚）
+MACHINE_ID = _machine_fingerprint()
 
 POOL_EMPTY_WAIT = 5      # 候选池为空时等待秒数后重掷
 HEARTBEAT_INTERVAL = 10  # 心跳间隔秒数
@@ -361,7 +380,9 @@ EVENTS_ROWS = 8          # 「Recent events」固定占几行（不足补空行 
 
 # ── 余额上报（多客户端汇总看板）──
 #     程序在多台 VPS 上跑，老板要随时看到每台的余额 → 客户端定期 POST 到中心看板。
-#     配置在 bot_config.ini：client_id / report_url / report_token（缺任一项 = 等同关闭）
+#     配置在 bot_config.ini：report_url / report_token（缺任一项 = 等同关闭 —— 这两项已打包进 exe）
+#     client_id 可不填：程序会自动带一个机器指纹，服务端按指纹自动发号（VPS-1 / VPS-2 …）
+#                 —— 填了就以填的为准（旧行为，可回滚）；每台 VPS 因此什么都不用配
 #     上报时机：余额一变就报；没变则每 REPORT_HEARTBEAT 秒心跳一次
 #              （心跳是必需的 —— 否则老板端分不清「余额没动」还是「这台掉线了」）
 #     上报走后台线程、超时 REPORT_TIMEOUT 秒即放弃、不重试 → 绝不拖慢下注
@@ -823,11 +844,13 @@ _report_ctl = {"last_bal": None, "last_ts": 0.0}
 
 
 def _report_ready() -> bool:
-    return bool(REPORT_ENABLED and REPORT_URL and CLIENT_ID and REPORT_TOKEN)
+    # 不再要求 client_id：没手填时由服务端按机器指纹自动发号（VPS-1 / VPS-2 …）
+    return bool(REPORT_ENABLED and REPORT_URL and REPORT_TOKEN)
 
 
 def _report_payload(status: str, reason: str = "", bal=None) -> dict:
-    return {"token": REPORT_TOKEN, "client_id": CLIENT_ID, "balance": bal,
+    return {"token": REPORT_TOKEN, "client_id": CLIENT_ID, "machine_id": MACHINE_ID,
+            "balance": bal,
             "currency": UI.get("currency") or "", "table": UI.get("table") or "",
             "status": status, "reason": reason, "ts": time.time()}
 
