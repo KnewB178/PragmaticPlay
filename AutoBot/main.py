@@ -404,8 +404,8 @@ REPORT_TIMEOUT = 3       # 单次上报超时（秒）
 #     · 只在「余额变化」时推（跟 EVO 一致，没变不推 → 尽量省 Google 配额）
 #     · 后台线程、超时 SHEET_TIMEOUT 秒、静默失败、不重试 → 绝不拖慢下注
 SHEET_TIMEOUT = 5        # 单次推送超时（秒）—— 跟 EVO 的 send_balance_async 一致
-SHEET_ID_PREFIX = "PP-"  # 名字前缀：EVO 用纯 IP，这里加 PP- 免得同机跑 EVO 时撞名
-                         # （改空字符串 "" 即与 EVO 完全一致 = 纯 IP）
+SHEET_ID_PREFIX = ""     # 名字 = 纯 IP（与 EVO 完全一致）
+                         # 旧值 "PP-"（加前缀免得同机跑 EVO 撞名）已停用，保留说明方便回滚
 # ─────────────────────────────────────────────────────────────
 
 tc_map = {}    # 桌名 → 最新 TC（主程序推的）
