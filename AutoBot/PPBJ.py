@@ -13,6 +13,10 @@ from paho.mqtt.client import CallbackAPIVersion
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import signal
 
+# ── PDEV 本地引擎（EVO 同款）── 与 pdev_local.py 同目录，直接 import ──
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pdev_local as _pdev
+
 init(autoreset=True)
 if sys.platform == "win32":
     os.system("title Pragmatic Play Blackjack")
@@ -150,6 +154,20 @@ def get_true_count(all_cards):
     return round(true_count, 2)
 
 # ===================================================================================== #
+#                                计算 PDEV（精准期望值）                                
+# ===================================================================================== #
+def get_pdev(all_cards):
+    """PDEV（不含 ECU）—— 把 1000 组「我方两张 × 庄家明牌」逐个取最优动作再加权平均。
+
+    引擎自带 128 份余牌组成的缓存，同一条 all_cards 反复算几乎零成本；
+    出任何问题都返回 None，绝不打断监听/推送主流程。
+    """
+    try:
+        return _pdev.compute_pdev(all_cards)["pdev"]
+    except Exception:
+        return None
+
+# ===================================================================================== #
 #                            导出最新局牌面（不含 True Count）                           
 # ===================================================================================== #
 def export_issued_cards_to_txt(table_name):
@@ -253,6 +271,8 @@ def export_all_rounds_to_txt(table_name):
     lines.append(f"\nTotal Card : {len(all_cards)}")
     tc = get_true_count(all_cards)
     lines.append(f"True Count : {tc}")
+    pdev = get_pdev(all_cards)
+    lines.append(_pdev.LABEL + (f"{pdev:.7f}" if pdev is not None else "—"))
 
     try:
         with open(filepath, "w", encoding="utf-8") as f:
@@ -300,6 +320,7 @@ def publish_pp_update(table_name, tc_val, cards, decisions=None):
 
     payload = {
         "tc": tc_val,
+        "pdev": get_pdev(cards),
         "total": len(cards),
         "cards": cards,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -544,9 +565,12 @@ async def listen_ws(table_name, url, row, retry=0):
 
                         all_cards = issued_cards.get(table_name, {}).get("all_cards", [])
                         tc_val = get_true_count(all_cards)
+                        pdev_val = get_pdev(all_cards)
                         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         tc_str = f"{tc_val:+6.2f}"
-                        line = f"{table_name:<25}| {tc_str} | {len(all_cards):>3} | {now}"
+                        pdev_str = f"{pdev_val:+.7f}" if pdev_val is not None else "      —"
+                        line = (f"{table_name:<25}| {tc_str} | {len(all_cards):>3} "
+                                f"| PDEV {pdev_str} | {now}")
                         color = Fore.GREEN if tc_val >= 1 else Fore.RED if tc_val < 0 else ""
                         if not voip_state[table_name]["activated"]:
                             color = Fore.LIGHTBLACK_EX

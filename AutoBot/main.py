@@ -230,6 +230,14 @@ _ev_mod = importlib.util.module_from_spec(_ev_spec)
 _ev_spec.loader.exec_module(_ev_mod)
 calc_ev = _ev_mod.calc_ev
 
+# PDEV 本地引擎（EVO 同款）—— pdev_local.py 是 pdev_local.js 的逐帧等价移植。
+# 除 TC 外再多算一个 composition-dependent 的精准期望值。
+# 口径：老板口径（明牌 A 只归一化不扣 BJ）· BJ 赔付 1.2 · S17 · 明牌 10 无 peek · 不含 ECU。
+_pdev_spec = importlib.util.spec_from_file_location("pdev_local", ROOT / "pdev_local.py")
+_pdev_mod = importlib.util.module_from_spec(_pdev_spec)
+_pdev_spec.loader.exec_module(_pdev_mod)
+compute_pdev = _pdev_mod.compute_pdev
+
 init(autoreset=True)
 
 HERE = _HERE   # 打包(frozen)后 = sys._MEIPASS；否则 = main.py 所在目录
@@ -519,6 +527,7 @@ UI = {
     "conn_secs": 0.0,           # 这张桌的已连接时长（秒）
     "stopped": "",              # 非空 = 已停止（显示 STOPPED 原因）
     "shoe_n": 0, "tc": 0.0, "taken": False,
+    "pdev": None, "pdev_issued": None,   # PDEV（不含 ECU）；None = 还没算出来
     "round": "—", "dealer": "—",
     "occupy": {},               # 座位 → 玩家名（连接期间）
     "scores": {},               # 本局: 座位 → 点数（暂不上屏，留着方便恢复）
@@ -556,6 +565,38 @@ def _hms(secs: float) -> str:
 
 def _tc_color(v: float) -> str:
     return Fore.GREEN if v >= 1 else (Fore.CYAN if v >= 0 else Fore.RED)
+
+
+PDEV_BASELINE = -0.006476944408866543   # 满靴（0 张已出）的 PDEV —— 用来判断「比新靴好还是差」
+
+
+def _pdev_txt() -> str:
+    v = UI.get("pdev")
+    if v is None:
+        return "—"
+    return f"{v:+.7f} [{UI.get('pdev_issued')}]"
+
+
+def _pdev_color() -> str:
+    v = UI.get("pdev")
+    if v is None:
+        return Fore.LIGHTBLACK_EX
+    if v > 0:
+        return Fore.GREEN                      # 正期望：这一靴对玩家有利
+    return Fore.CYAN if v >= PDEV_BASELINE else Fore.RED
+
+
+def update_pdev(cards):
+    """按整靴已出牌算 PDEV（不含 ECU）。
+    引擎自带 128 份余牌组成缓存 —— 同一状态重复算几乎零成本（实测 ~9ms/次）。
+    出任何问题都只让板面显示「—」，绝不打断主流程。"""
+    try:
+        r = compute_pdev(cards)
+        UI["pdev"] = r["pdev"]
+        UI["pdev_issued"] = r["issued"]
+    except Exception:
+        UI["pdev"] = None
+        UI["pdev_issued"] = None
 
 
 def seat_disp(s) -> str:
@@ -607,6 +648,7 @@ def render():
              "├" + bar + "┤",
              row(f"Shoe {UI['shoe_n']}/{SHOE_TOTAL}   {taken_txt}   TC {UI['tc']:+.2f}",
                  _tc_color(UI["tc"])),
+             row(f"{'PDEV':<9} : {_pdev_txt()}", _pdev_color()),
              "├" + bar + "┤",
              row(f"{'GameID':<9} : {UI['round']}"),
              row(f"{'Dealer':<9} : {UI['dealer']}"),
@@ -629,6 +671,7 @@ def render():
              "├" + bar + "┤",
              row(f"Shoe {UI['shoe_n']}/{SHOE_TOTAL}   {taken_txt}   TC {UI['tc']:+.2f}",
                  _tc_color(UI["tc"])),
+             row(f"{'PDEV':<9} : {_pdev_txt()}", _pdev_color()),
              "├" + bar + "┤",
              row(f"{'GameID':<9} : {UI['round']}"),
              row(f"{'Dealer':<9} : {UI['dealer']}"),
@@ -1286,6 +1329,7 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None):
         UI["tc"] = shoe.tc
         UI["taken"] = True
         UI["cards"] = [str(c) for c in shoe.cards]
+        update_pdev(shoe.cards)          # 除 TC 外同步算 PDEV（同一份已出牌账本，不用另开）
         render()
 
     async with websockets.connect(url, ssl=_WSS_SSL if url.startswith("wss") else None) as ws:

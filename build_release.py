@@ -38,10 +38,10 @@ WORK = APP / "build"                            # 中间产物目录
 EXE = DIST / f"{NAME}.exe"
 
 # PyInstaller 要一起打进去的数据文件（源文件 ; 打进 exe 后的相对路径 .）
-ADD_DATA = ["PP EV.py", "table_id.txt", "bot_config.ini"]
+ADD_DATA = ["PP EV.py", "table_id.txt", "bot_config.ini", "pdev_local.py"]
 
 # 自检：这几个文件必须原样出现在 exe 里
-CHECK_FILES = ["bot_config.ini", "table_id.txt", "PP EV.py"]
+CHECK_FILES = ["bot_config.ini", "table_id.txt", "PP EV.py", "pdev_local.py"]
 
 # GitHub Release 目标
 GH_OWNER, GH_REPO = "KnewB178", "PragmaticPlay"
