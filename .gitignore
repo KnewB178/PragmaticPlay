@@ -33,3 +33,6 @@ desktop.ini
 
 # ---- WorkBuddy 工作区记忆 ----
 .workbuddy/
+
+# 大厅原始帧（每次采集都变，不入库）
+lobby_raw.jsonl

@@ -1,0 +1,234 @@
+# casinoId=ppcdg00000001767  currency=MYR  2026-10-15 23:32:49
+# 桌名 | 桌号 | snapId | 桌型 | 子类型
+Amazing Baccarat | 4531 | amazingbacarat01 | BACCARAT | speedbaccarat
+Baccarat 1 | 401 | h22z8qhp17sa0vkh | BACCARAT | baccarat6
+Baccarat 2 | 404 | 9j3eagurfwmml7z2 | BACCARAT | baccarat6
+Baccarat 3 | 422 | cbcf6qas8fscb222 | BACCARAT | baccarat6
+Baccarat 5 | 411 | ne074fgn4bd1150i | BACCARAT | baccarat6
+Baccarat 6 | 413 | oq808ojps709qqaf | BACCARAT | baccarat6
+Baccarat 7 | 425 | bcpirpmfpeobc191 | BACCARAT | baccarat6
+Baccarat 9 | 436 | bcpirpmfpobc1912 | BACCARAT | speedbaccarat
+Cantonese Speed Baccarat | 4466 | tobcbaccaragen92 | BACCARAT | speedbaccarat
+Chinese Speed Baccarat 1 | 481 | spijbnsu408vmv71 | BACCARAT | speedbaccarat
+Chinese Speed Baccarat 2 | 482 | spijbnsu408vmv72 | BACCARAT | speedbaccarat
+Chinese Speed Baccarat 3 | 483 | spijbnsu408vmv73 | BACCARAT | speedbaccarat
+Fortune 6 Baccarat | 434 | bcpirpmfpobc1910 | BACCARAT | speedbaccarat
+Indonesian Speed Baccarat 1 | 450 | speedbca18generi | BACCARAT | speedbaccarat
+Indonesian Speed Baccarat 2 | 496 | spvtbc281vsbc281 | BACCARAT | speedbaccarat
+Japanese Speed Baccarat 1 | 488 | spto41bctorobc41 | BACCARAT | speedbaccarat
+Japanese Speed Baccarat 2 | 489 | spto42bctorobc42 | BACCARAT | speedbaccarat
+Japanese Speed Baccarat 3 | 490 | spto43bctorobc43 | BACCARAT | speedbaccarat
+Korean Baccarat 1 | 460 | tobc52koreanto52 | BACCARAT | baccarat6
+Korean Baccarat 2 | 499 | tobcspbaccarat92 | BACCARAT | baccarat6
+Korean Speed Baccarat 1 | 441 | bc281koreanch281 | BACCARAT | speedbaccarat
+Korean Speed Baccarat 2 | 449 | bc392chromabc392 | BACCARAT | speedbaccarat
+Korean Speed Baccarat 3 | 459 | tobc51koreanto51 | BACCARAT | speedbaccarat
+Korean Speed Baccarat 5 | 476 | tobcspbaccarat61 | BACCARAT | speedbaccarat
+Korean Turbo Baccarat 1 | 477 | tobcspbaccarat62 | BACCARAT | speedbaccarat
+MEGA BACCARAT | 442 | mbc371rpmfmbc371 | BACCARAT | speedbaccarat
+Privé Lounge Baccarat 1 | 454 | privbca51privbc1 | BACCARAT | speedbaccarat
+Privé Lounge Baccarat 2 | 455 | privbca52privbc2 | BACCARAT | speedbaccarat
+Privé Lounge Baccarat 3 | 456 | privbca53privbc3 | BACCARAT | speedbaccarat
+Privé Lounge Baccarat 5 | 458 | privbca55privbc5 | BACCARAT | speedbaccarat
+Privé Lounge Baccarat 6 | 466 | bca51priv16bca51 | BACCARAT | speedbaccarat
+Privé Lounge Baccarat 7 | 467 | bca51priv17bca51 | BACCARAT | speedbaccarat
+Privé Lounge Baccarat 8 | 468 | bca51priv18bca51 | BACCARAT | speedbaccarat
+SQUEEZE BACCARAT | 851 | bcadigitalsqz001 | BACCARAT | baccarat6
+Seotda Baccarat | 4601 | seotdabaccarat01 | BACCARAT | seotdabaccarat
+Speed Baccarat 1 | 402 | pwnhicogrzeodk79 | BACCARAT | speedbaccarat
+Speed Baccarat 11 | 424 | cbcf6qas8fscb224 | BACCARAT | speedbaccarat
+Speed Baccarat 12 | 421 | cbcf6qas8fscb221 | BACCARAT | speedbaccarat
+Speed Baccarat 13 | 438 | m88hicogrzeod202 | BACCARAT | speedbaccarat
+Speed Baccarat 15 | 427 | bcpirpmfpeobc193 | BACCARAT | speedbaccarat
+Speed Baccarat 16 | 435 | bcpirpmfpobc1911 | BACCARAT | speedbaccarat
+Speed Baccarat 17 | 439 | bcpirpmfpebc1908 | BACCARAT | speedbaccarat
+Speed Baccarat 18 | 405 | b0jf7rlboleibnap | BACCARAT | speedbaccarat
+Speed Baccarat 2 | 403 | kkqnazmd8ttq7fgd | BACCARAT | speedbaccarat
+Speed Baccarat 3 | 412 | s8s9f0quk3ygiyb1 | BACCARAT | speedbaccarat
+Speed Baccarat 5 | 414 | 886ewimul28yw14j | BACCARAT | speedbaccarat
+Speed Baccarat 6 | 415 | 2q57e43m4ivqwaq3 | BACCARAT | speedbaccarat
+Speed Baccarat 8 | 432 | bcpirpmfpeobc198 | BACCARAT | speedbaccarat
+Speed Baccarat 9 | 430 | bcpirpmfpeobc196 | BACCARAT | speedbaccarat
+Super 8 Baccarat | 433 | bcpirpmfpeobc199 | BACCARAT | speedbaccarat
+Thai Baccarat 1 | 453 | baccaratspstua13 | BACCARAT | baccarat6
+Thai Speed Baccarat 1 | 451 | speedbca14gesbc1 | BACCARAT | speedbaccarat
+Thai Speed Baccarat 2 | 452 | speedbca14gesbc2 | BACCARAT | speedbaccarat
+Turbo Baccarat | 426 | bcpirpmfpeobc192 | BACCARAT | speedbaccarat
+Vietnamese Speed Baccarat 1 | 479 | spto11bctorobc11 | BACCARAT | speedbaccarat
+Vietnamese Speed Baccarat 2 | 480 | spto12bctorobc12 | BACCARAT | speedbaccarat
+Vietnamese Speed Baccarat 3 | 484 | spto21bctorobc21 | BACCARAT | speedbaccarat
+Blackjack 1 | 515 | m24f0zhzupicvchc | BLACKJACK | classicblackjack
+Blackjack 10 | 517 | 32pd67uvn4p4m1pi | BLACKJACK | classicblackjack
+Blackjack 11 | 301 | sm9wsky7hh3ynx98 | BLACKJACK | classicblackjack
+Blackjack 12 | 302 | cy8me4k2b1en4r09 | BLACKJACK | classicblackjack
+Blackjack 14 | 303 | vu91g33enwnxhx3g | BLACKJACK | classicblackjack
+Blackjack 148 | 612 | sobj221blackjack | BLACKJACK | classicblackjack
+Blackjack 149 | 613 | sobj222blackjack | BLACKJACK | classicblackjack
+Blackjack 15 | 304 | 8d38bnlijtxhmrge | BLACKJACK | classicblackjack
+Blackjack 150 | 658 | sobj251blackjack | BLACKJACK | classicblackjack
+Blackjack 151 | 645 | sobj235blackjack | BLACKJACK | classicblackjack
+Blackjack 152 | 646 | sobj236blackjack | BLACKJACK | classicblackjack
+Blackjack 16 | 305 | t0cdkkil0tev97gh | BLACKJACK | classicblackjack
+Blackjack 17 | 521 | bas2sgk7ph2ybj17 | BLACKJACK | classicblackjack
+Blackjack 18 | 522 | bas2sgk7ph2ybj18 | BLACKJACK | classicblackjack
+Blackjack 19 | 523 | bas2sgk7ph2ybj19 | BLACKJACK | classicblackjack
+Blackjack 2 | 519 | 22cm03wwntad3rjv | BLACKJACK | classicblackjack
+Blackjack 20 | 524 | bas2sgk7ph2ybj20 | BLACKJACK | classicblackjack
+Blackjack 21 | 525 | bas2sgk7ph2ybj21 | BLACKJACK | classicblackjack
+Blackjack 22 | 526 | bas2sgk7ph2ybj22 | BLACKJACK | classicblackjack
+Blackjack 23 | 527 | bas2sgk7ph2ybj23 | BLACKJACK | classicblackjack
+Blackjack 24 | 528 | bas2sgk7ph2ybj24 | BLACKJACK | classicblackjack
+Blackjack 25 | 529 | bas2sgk7ph2ybj25 | BLACKJACK | classicblackjack
+Blackjack 26 | 530 | bas2sgk7ph2ybj26 | BLACKJACK | classicblackjack
+Blackjack 27 | 539 | bas2sgk7ph2ybj05 | BLACKJACK | classicblackjack
+Blackjack 28 | 538 | bas2sgk7ph2ybj04 | BLACKJACK | classicblackjack
+Blackjack 29 | 537 | bas2sgk7ph2ybj03 | BLACKJACK | classicblackjack
+Blackjack 3 | 511 | tjtrahl9gblxxlkc | BLACKJACK | classicblackjack
+Blackjack 30 | 536 | bas2sgk7ph2ybj02 | BLACKJACK | classicblackjack
+Blackjack 31 | 535 | bas2sgk7ph2ybj01 | BLACKJACK | classicblackjack
+Blackjack 32 | 540 | bas2sgk7ph2ybj06 | BLACKJACK | classicblackjack
+Blackjack 33 | 541 | geogamingh2bj141 | BLACKJACK | classicblackjack
+Blackjack 34 | 542 | geogamingh2bj142 | BLACKJACK | classicblackjack
+Blackjack 35 | 543 | geogamingh2bj143 | BLACKJACK | classicblackjack
+Blackjack 36 | 544 | geogamingh2bj144 | BLACKJACK | classicblackjack
+Blackjack 37 | 562 | bjusbim6hcbj2417 | BLACKJACK | classicblackjack
+Blackjack 38 | 563 | bjusbim6hcbj2418 | BLACKJACK | classicblackjack
+Blackjack 39 | 564 | bjusbim6hcbj2419 | BLACKJACK | classicblackjack
+Blackjack 4 | 514 | 8li4ycefgbq67uqe | BLACKJACK | classicblackjack
+Blackjack 40 | 565 | bjusbim6hcbj2420 | BLACKJACK | classicblackjack
+Blackjack 41 | 555 | bjusbim6hcbj2410 | BLACKJACK | classicblackjack
+Blackjack 42 | 556 | bjusbim6hcbj2411 | BLACKJACK | classicblackjack
+Blackjack 43 | 557 | bjusbim6hcbj2412 | BLACKJACK | classicblackjack
+Blackjack 44 | 558 | bjusbim6hcbj2413 | BLACKJACK | classicblackjack
+Blackjack 45 | 559 | bjusbim6hcbj2414 | BLACKJACK | classicblackjack
+Blackjack 46 | 560 | bjusbim6hcbj2415 | BLACKJACK | classicblackjack
+Blackjack 47 | 561 | bjusbim6hcbj2416 | BLACKJACK | classicblackjack
+Blackjack 48 | 551 | bjusbim6hcmbj246 | BLACKJACK | classicblackjack
+Blackjack 49 | 552 | bjusbim6hcmbj247 | BLACKJACK | classicblackjack
+Blackjack 5 | 518 | v8ud3opn87pr3mtl | BLACKJACK | classicblackjack
+Blackjack 50 | 553 | bjusbim6hcmbj248 | BLACKJACK | classicblackjack
+Blackjack 51 | 554 | bjusbim6hcmbj249 | BLACKJACK | classicblackjack
+Blackjack 52 | 594 | sobj215blackjack | BLACKJACK | classicblackjack
+Blackjack 53 | 595 | sobj216blackjack | BLACKJACK | classicblackjack
+Blackjack 54 | 596 | sobj217blackjack | BLACKJACK | classicblackjack
+Blackjack 55 | 597 | sobj218blackjack | BLACKJACK | classicblackjack
+Blackjack 56 | 593 | sobj214blackjack | BLACKJACK | classicblackjack
+Blackjack 57 | 598 | sobj271blackjack | BLACKJACK | classicblackjack
+Blackjack 58 | 599 | sobj272blackjack | BLACKJACK | classicblackjack
+Blackjack 59 | 600 | sobj273blackjack | BLACKJACK | classicblackjack
+Blackjack 6 | 512 | mlu2hu6hv0egfxcz | BLACKJACK | classicblackjack
+Blackjack 60 | 601 | sobj274blackjack | BLACKJACK | classicblackjack
+Blackjack 61 | 602 | sobj275blackjack | BLACKJACK | classicblackjack
+Blackjack 62 | 603 | sobj276blackjack | BLACKJACK | classicblackjack
+Blackjack 63 | 590 | sobj211blackjack | BLACKJACK | classicblackjack
+Blackjack 64 | 620 | sobj261blackjack | BLACKJACK | classicblackjack
+Blackjack 65 | 621 | sobj262blackjack | BLACKJACK | classicblackjack
+Blackjack 7 | 513 | svs6717sc9512qjb | BLACKJACK | classicblackjack
+Blackjack 70 | 626 | sobj267blackjack | BLACKJACK | classicblackjack
+Blackjack 71 | 616 | sobj225blackjack | BLACKJACK | classicblackjack
+Blackjack 72 | 617 | sobj226blackjack | BLACKJACK | classicblackjack
+Blackjack 74 | 619 | sobj228blackjack | BLACKJACK | classicblackjack
+Blackjack 77 | 569 | sbjsbim6hsbj2424 | BLACKJACK | classicblackjack
+Blackjack 78 | 570 | sbjsbim6hsbj2425 | BLACKJACK | classicblackjack
+Blackjack 8 | 520 | z4u19edve6kj103k | BLACKJACK | classicblackjack
+Blackjack 9 | 516 | vnaito309wbtypo8 | BLACKJACK | classicblackjack
+BlackjackX 41 | 3491 | rngbjblarngbjx41 | BLACKJACK | bjx
+BlackjackX 42 | 3492 | rngbjblarngbjx42 | BLACKJACK | bjx
+BlackjackX 43 | 3493 | rngbjblarngbjx43 | BLACKJACK | bjx
+BlackjackX 44 | 3494 | rngbjblarngbjx44 | BLACKJACK | bjx
+BlackjackX 45 | 3495 | rngbjblarngbjx45 | BLACKJACK | bjx
+BlackjackX 46 | 3496 | rngbjblarngbjx46 | BLACKJACK | bjx
+BlackjackX 47 | 3497 | rngbjblarngbjx47 | BLACKJACK | bjx
+BlackjackX 48 | 3498 | rngbjblarngbjx48 | BLACKJACK | bjx
+Free Bet Blackjack 11 | 618 | sobj227blackjack | BLACKJACK | freeBetBj
+Free Bet Blackjack 9 | 615 | sobj224blackjack | BLACKJACK | freeBetBj
+Indonesian BlackjackX 21 | 3499 | rngindobrngbjx21 | BLACKJACK | bjx
+Indonesian BlackjackX 22 | 3500 | rngindobrngbjx22 | BLACKJACK | bjx
+Indonesian BlackjackX 23 | 3501 | rngindobrngbjx23 | BLACKJACK | bjx
+Indonesian BlackjackX 24 | 3502 | rngindobrngbjx24 | BLACKJACK | bjx
+Indonesian BlackjackX 25 | 3503 | rngindobrngbjx25 | BLACKJACK | bjx
+Indonesian BlackjackX 26 | 3504 | rngindobrngbjx26 | BLACKJACK | bjx
+Indonesian BlackjackX 27 | 3505 | rngindobrngbjx27 | BLACKJACK | bjx
+Indonesian BlackjackX 28 | 3506 | rngindobrngbjx28 | BLACKJACK | bjx
+Indonesian BlackjackX 29 | 3507 | rngindobrngbjx29 | BLACKJACK | bjx
+Indonesian BlackjackX 30 | 3508 | rngindobrngbjx30 | BLACKJACK | bjx
+Korean BlackjackX 4 | 3509 | rngkorearngbjx04 | BLACKJACK | bjx
+Korean BlackjackX 5 | 3510 | rngkorearngbjx05 | BLACKJACK | bjx
+Korean BlackjackX 6 | 3511 | rngkorearngbjx06 | BLACKJACK | bjx
+Korean BlackjackX 7 | 3512 | rngkorearngbjx07 | BLACKJACK | bjx
+Korean BlackjackX 8 | 3513 | rngkorearngbjx08 | BLACKJACK | bjx
+Speed Blackjack 1 | 566 | sbjsbim6hsbj2421 | BLACKJACK | speedblackjack
+Speed Blackjack 10 | 606 | sobj279blackjack | BLACKJACK | speedblackjack
+Speed Blackjack 11 | 607 | sobj2710blackjac | BLACKJACK | speedblackjack
+Speed Blackjack 12 | 608 | sobj2711blackjac | BLACKJACK | speedblackjack
+Speed Blackjack 14 | 609 | sobj2712blackjac | BLACKJACK | speedblackjack
+Speed Blackjack 17 | 614 | sobj223blackjack | BLACKJACK | speedblackjack
+Speed Blackjack 2 | 567 | sbjsbim6hsbj2422 | BLACKJACK | speedblackjack
+Speed Blackjack 20 | 659 | sobj252blackjack | BLACKJACK | speedblackjack
+Speed Blackjack 21 | 660 | sobj253blackjack | BLACKJACK | speedblackjack
+Speed Blackjack 22 | 661 | sobj254blackjack | BLACKJACK | speedblackjack
+Speed Blackjack 24 | 641 | sobj231blackjack | BLACKJACK | speedblackjack
+Speed Blackjack 25 | 642 | sobj232blackjack | BLACKJACK | speedblackjack
+Speed Blackjack 26 | 643 | sobj233blackjack | BLACKJACK | speedblackjack
+Speed Blackjack 27 | 644 | sobj234blackjack | BLACKJACK | speedblackjack
+Speed Blackjack 3 | 568 | sbjsbim6hsbj2423 | BLACKJACK | speedblackjack
+Speed Blackjack 30 | 647 | sobj237blackjack | BLACKJACK | speedblackjack
+Speed Blackjack 6 | 591 | sobj212blackjack | BLACKJACK | speedblackjack
+Speed Blackjack 7 | 592 | sobj213blackjack | BLACKJACK | speedblackjack
+Speed Blackjack 8 | 604 | sobj277blackjack | BLACKJACK | speedblackjack
+Speed Blackjack 9 | 605 | sobj278blackjack | BLACKJACK | speedblackjack
+Turkish Blackjack 1 | 322 | sobj162blackjack | BLACKJACK | classicblackjack
+Turkish BlackjackX 13 | 3483 | rngbjturkrngbj13 | BLACKJACK | bjx
+Turkish BlackjackX 14 | 3484 | rngbjturkrngbj14 | BLACKJACK | bjx
+Turkish BlackjackX 15 | 3485 | rngbjturkrngbj15 | BLACKJACK | bjx
+Turkish BlackjackX 16 | 3486 | rngbjturkrngbj16 | BLACKJACK | bjx
+Turkish BlackjackX 17 | 3487 | rngbjturkrngbj17 | BLACKJACK | bjx
+Turkish BlackjackX 18 | 3488 | rngbjturkrngbj18 | BLACKJACK | bjx
+Turkish BlackjackX 19 | 3489 | rngbjturkrngbj19 | BLACKJACK | bjx
+Turkish BlackjackX 20 | 3490 | rngbjturkrngbj20 | BLACKJACK | bjx
+Turkish Speed Blackjack 1 | 321 | sobj161blackjack | BLACKJACK | speedblackjack
+Color Game Bonanza | 8101 | cg00000000000001 | COLORGAME | colorgame
+Dragon Tiger | 1001 | drag0ntig3rsta48 | DRAGONTIGER | None
+High Flyer | 2201 | haphflyer2201jfm | HIGHFLYER | HighFlyer
+Mega Sic Bac | 2101 | a10megasicbaca10 | MEGASICBAC | megasicbac
+Mega Wheel | 801 | md500q83g7cdefw1 | MEGAWHEEL | jackpotwheel
+Money Time | 2750 | moneytime2500002 | MONEYTIME | moneyTime
+BACCARAT_MULTIPLAY | 007 | 007 | MTB | None
+ONE Blackjack 1 | 901 | wmlbmkp87fxb9lzz | ONEBJ | OneBJ
+ONE Blackjack 2 | 902a9 | gdvae0o7lt754h9m | ONEBJ | OneBJ
+Auto Mega Roulette | 210 | 1hl323e1lxuqdrkr | ROULETTE | megaroulette
+Auto Roulette | 225 | 5bzl2835s5ruvweg | ROULETTE | autoroulette
+Brazilian Roulette | 237 | rwbrzportrwa16rg | ROULETTE | pp_dev_test_roulette
+Fortune Roulette | 270 | megaroulettbba91 | ROULETTE | megaroulette
+Gates Of Olympus Roulette | 2244 | gatesofolympus01 | ROULETTE | megaroulette
+German Roulette | 222 | s2x6b4jdeqza2ge2 | ROULETTE | pp_dev_test_roulette
+Immersive Roulette Deluxe | 292 | 25irclas25imrcrw | ROULETTE | pp_dev_test_roulette
+Korean Roulette | 213 | 381rwkr381korean | ROULETTE | pp_dev_test_roulette
+Lucky 6 Roulette | 211 | lucky6roulettea3 | ROULETTE | megaroulette
+Mega Roulette | 204 | 1hl65ce1lxuqdrkr | ROULETTE | megaroulette
+Mega Roulette 3000 | 2901 | megaroulette3k01 | ROULETTE | megaroulette
+PowerUp Roulette | 240 | powruprw1qm3xc25 | ROULETTE | poweruproulette
+Privé Lounge Roulette | 28201 | privroulettegt01 | ROULETTE | roulette
+Romanian Roulette | 233 | romania233rwl291 | ROULETTE | pp_dev_test_roulette
+Roulette 1 | 227 | g03y1t9vvuhrfytl | ROULETTE | pp_dev_test_roulette
+Roulette 2 Extra Time | 201 | 5kvxlw4c1qm3xcyn | ROULETTE | pp_dev_test_roulette
+Roulette 3 | 230 | chroma229rwltr22 | ROULETTE | pp_dev_test_roulette
+Roulette Italia Tricolore | 223 | v1c52fgw7yy02upz | ROULETTE | pp_dev_test_roulette
+Roulette Latina | 234 | roulerw234rwl292 | ROULETTE | pp_dev_test_roulette
+Roulette Macao | 206 | yqpz3ichst2xg439 | ROULETTE | macao
+Russian Roulette | 221 | t4jzencinod6iqwi | ROULETTE | pp_dev_test_roulette
+SPEED ROULETTE 2 | 205 | r20speedrtwo201s | ROULETTE | pp_dev_test_roulette
+Speed Auto Roulette | 226 | autorwra311autor | ROULETTE | autoroulette
+Speed Roulette 1 | 203 | fl9knouu0yjez2wi | ROULETTE | pp_dev_test_roulette
+Turkish Mega Roulette | 208 | megar0ul3tt3trk1 | ROULETTE | megaroulette
+Turkish Roulette | 224 | p8l1j84prrmxzyic | ROULETTE | pp_dev_test_roulette
+VIP Auto Roulette | 266 | ar25vipautorw251 | ROULETTE | autoroulette
+VIP Roulette | 545 | geogamingh2rw545 | ROULETTE | pp_dev_test_roulette
+Snakes & Ladders Live | 1601 | snakeladder26101 | SNAKESANDLADDERSLIVE | snakesandladderslive
+Big Bass Crash | 1320 | bigbassnewbb1320 | SPACEMAN | BigBassCrash
+Spaceman | 1301 | spacemanyxe123nh | SPACEMAN | Spaceman
+Sweet Bonanza CandyLand | 1101 | pbvzrfk1fyft4dwe | SWEETBONANZA | SweetBonanza
+Mega Sic Bo | 701 | megasicboauto001 | SicBO | standard_sicbo
+SicBo | 711a | sba71kkmr2ssba71 | SicBO | standard_sicbo
+Football Blitz Top Card | 4001 | ge49e4os88bp4bi6 | TOPCARD | topcard
+Treasure Island | 1701 | treasureadvgt001 | TREASUREISLAND | TreasureIsland

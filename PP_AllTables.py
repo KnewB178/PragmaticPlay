@@ -1,222 +1,213 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PP 大厅全量桌号采集器 —— 不做任何桌型筛选，服务端推什么就记什么。
+PP_AllTables.py —— Pragmatic Play 大厅「全量桌号」采集器（不做任何桌型筛选）
 
-原采集器（ws-collector.py / PPBJ_Table_List.py）里有一句
-    if data.get("tableType") != "BLACKJACK": continue
-把黑杰克以外的桌（百家乐/轮盘/骰宝/龙虎/游戏秀…）全滤掉了。
-本脚本去掉这层筛选。
+为什么之前采不到
+────────────────
+1. 大厅 WS 换域名了：老的 wss://dga.pplc001.net/ws 现在对任何 casinoId 都回
+   {"error":"Casino not supported: ... (key: NNN)"}。
+   新的（由 PP 前端 /api/env/getAll 的 "dgaWS" 字段给出）是：
+       wss://dga-lc.pplc001.net/ws
+2. 原来的 ws-collector.py / PPBJ_Table_List.py 里有一行
+   `if msg.get("tableType") != "BLACKJACK": return`
+   —— 所有非 21 点的桌都被这一行丢掉了。
 
-两种取数方式：
-  1) HTTP 大厅接口（推荐，一次拿全）：
-        https://<gs-host>/api/ui/lobby?JSESSIONID=<sid>
-     不带 session 会回 401 <response><session>offline</session></response>
-  2) WebSocket 大厅（老方式，服务端逐条推）：
-        wss://<host>/ws   +  subscribe{casinoId, key[], currency}
+本脚本做什么
+────────────
+连上大厅 → 服务端会主动下发一条 {"tableKey":[...]} 帧，这就是该 casino
+**全部桌号**（含百家乐 / 轮盘 / 骰宝 / 龙虎 / One Blackjack / 游戏秀 …）。
+然后拿这份全量 key 再订阅一次，把所有桌的桌名 / 类型收下来。
 
-用法：
-    python PP_AllTables.py <JSESSIONID>
-    python PP_AllTables.py <JSESSIONID> --host gs3.pplc001.net
-    python PP_AllTables.py --ws            # 走 WebSocket 大厅
+用法
+────
+    python PP_AllTables.py                      # 用默认 casinoId / MYR
+    python PP_AllTables.py <casinoId> [currency] [seconds]
 
-产物：
-    lobby_raw.txt     原始响应（不解析，先留证据）
-    All_Tables.txt    全量桌号： 名字 | 桌号 | 类型
+产物（写在脚本同目录）
+────
+    All_Tables.txt   : 桌名 | 桌号 | snapId | 桌型 | 子类型
+                       （桌号 = 帧里的 tableId；snapId = 你原本 table_id.txt 里那种串，
+                         两个都能直接塞进 tableConfig / wss URL 的 tableId 参数）
+    Server_Keys.txt  : 服务端下发的全部 key（一行一个，不筛选）
+    lobby_raw.jsonl  : 服务端原始帧留证
+
+无鉴权：大厅 WS 不需要 JSESSIONID，只需要 casinoId。
 """
-from __future__ import annotations
 
-import argparse
+import asyncio
 import json
-import re
+import os
 import sys
 import time
-from pathlib import Path
 
-import requests
+import websockets
 
-HERE = Path(__file__).resolve().parent
-OUT_RAW = HERE / "lobby_raw.txt"
-OUT_ALL = HERE / "All_Tables.txt"
+DGA_WS = "wss://dga-lc.pplc001.net/ws"
+
+# 默认值 = 本项目一直在用的运营商 casino（跟余额接口 /api/ui/balance 返回的一致）
+DEFAULT_CASINO = "ppcdg00000001767"
+DEFAULT_CURRENCY = "MYR"
+
+# 种子 key：先随便订几个已知桌，服务端就会把全量 tableKey 回给你
+SEED_KEYS = ["515", "566", "403", "227", "1101", "801"]
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
-LOBBY_HOSTS = ["gs3.pplc001.net", "gs1.pplc001.net", "gs2.pplc001.net",
-               "gs4.pplc001.net", "gs5.pplc001.net", "gs6.pplc001.net",
-               "games.pplc001.net"]
 
-WS_LOBBY = "wss://dga.pplc001.net/ws"
-CASINO_ID = "ppcdg00000001767"
-
-ID_KEYS = ("tableId", "key", "snapId", "tableKey", "id")
-NAME_KEYS = ("tableName", "name", "displayName", "tableDescription")
-TYPE_KEYS = ("tableType", "gameType", "tableSubtype", "gameCode", "subtype")
+def _log(msg):
+    print(msg, flush=True)
 
 
-# ────────────────────────────────────────────────────────────── HTTP 大厅 ──
-def fetch_http_lobby(sid: str, hosts: list[str]):
-    for h in hosts:
-        url = f"https://{h}/api/ui/lobby"
+async def collect(casino, currency, seconds):
+    all_keys = []          # 服务端下发的全量 key
+    tables = {}            # tableId -> {name, type, subtype, ...}
+    raw_frames = []
+    errors = []
+
+    async with websockets.connect(DGA_WS, additional_headers={"User-Agent": UA},
+                                  open_timeout=20, close_timeout=5,
+                                  max_size=8 * 1024 * 1024) as ws:
+        _log("  [connected] %s" % DGA_WS)
+
+        await ws.send(json.dumps({"type": "available", "casinoId": casino}))
+        await asyncio.sleep(0.4)
+        await ws.send(json.dumps({"type": "subscribe", "isDeltaEnabled": True,
+                                  "casinoId": casino, "key": SEED_KEYS,
+                                  "currency": currency}))
+
+        subscribed_all = False
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=max(1.0, seconds - (time.time() - t0)))
+            except asyncio.TimeoutError:
+                break
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", "replace")
+            raw_frames.append(raw)
+
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+
+            if isinstance(msg, dict) and "error" in msg:
+                errors.append(msg["error"])
+                continue
+
+            # ① 服务端下发的全量 key
+            if isinstance(msg, dict) and msg.get("tableKey") and not all_keys:
+                all_keys = list(msg["tableKey"])
+                _log("  [tableKey] 服务端下发全部桌号: %d 个" % len(all_keys))
+                # ② 拿全量 key 再订一次（分批，避免 message too big）
+                for i in range(0, len(all_keys), 250):
+                    chunk = all_keys[i:i + 250]
+                    await ws.send(json.dumps({"type": "subscribe", "isDeltaEnabled": True,
+                                              "casinoId": casino, "key": chunk,
+                                              "currency": currency}))
+                    await asyncio.sleep(0.3)
+                subscribed_all = True
+
+            # ③ 桌帧
+            if isinstance(msg, dict) and msg.get("tableId") and msg.get("tableName"):
+                tid = str(msg["tableId"])
+                snap = _snap_id(msg.get("relativeSnapPath") or msg.get("tableImage") or "") or tid
+                tables[tid] = {
+                    "name": msg.get("tableName"),
+                    "type": msg.get("tableType"),
+                    "subtype": msg.get("tableSubtype"),
+                    "snap": snap,
+                    "open": msg.get("tableOpen", True),
+                    "seats": msg.get("totalSeatedPlayers"),
+                    "min_bet": (msg.get("tableLimits") or {}).get("minBet"),
+                    "fields": sorted(msg.keys()),
+                }
+
         try:
-            r = requests.get(url, params={"JSESSIONID": sid}, timeout=15,
-                             headers={"User-Agent": UA}, allow_redirects=False)
-        except Exception as e:
-            print(f"  [x] {h:<20} 连不上：{type(e).__name__}")
-            continue
-        body = r.text
-        print(f"  [{'+' if r.status_code == 200 else ' '}] {h:<20} "
-              f"HTTP {r.status_code}  {len(body)} 字节")
-        if "session" in body[:200].lower() and "offline" in body[:200].lower():
-            print("        ↑ session 无效或已过期")
-            continue
-        if r.status_code == 200 and body.strip():
-            return h, body
-    return None, None
+            await ws.close()
+        except Exception:
+            pass
+
+    return all_keys, tables, raw_frames, errors, subscribed_all
 
 
-# ────────────────────────────────────────────────── WebSocket 大厅（不筛型） ──
-def collect_ws_lobby(duration: float = 40.0):
-    import asyncio
-    import websockets
-
-    keys = [str(k) for k in
-            [594, 521, 596, 522, 538, 518, 593, 563, 515, 590, 555, 543,
-             597, 565, 561, 511, 560, 592, 524, 520, 525, 567, 517, 566,
-             544, 523, 528, 536, 553, 562, 516, 556, 540, 564, 513, 595,
-             552, 526, 514, 529, 537, 602, 530, 527, 606, 568, 301, 570,
-             303, 304, 519, 535, 626, 542, 541, 604, 605, 551, 554, 305,
-             302, 512, 569, 321, 322, 591, 612, 613, 614, 615, 616, 617,
-             618, 619, 641, 642, 643, 644, 645, 646, 647, 658, 659, 660,
-             661, 620, 621, 607, 608, 609, 598, 599, 600, 601, 603]]
-
-    async def run():
-        frames = []
-        async with websockets.connect(WS_LOBBY, open_timeout=12, max_size=None) as ws:
-            await ws.send(json.dumps({
-                "type": "subscribe", "isDeltaEnabled": True,
-                "casinoId": CASINO_ID, "currency": "MYR", "key": keys,
-            }))
-            print(f"[WS] 已订阅 {len(keys)} 个 key，收 {duration:.0f} 秒…")
-            t0 = time.time()
-            while time.time() - t0 < duration:
-                try:
-                    raw = await asyncio.wait_for(ws.recv(),
-                                                 timeout=duration - (time.time() - t0))
-                except asyncio.TimeoutError:
-                    break
-                frames.append(raw)
-        return frames
-
-    return asyncio.run(run())
+def _snap_id(path):
+    """从 relativeSnapPath 里抽出 snapId（跟原 ws-collector.py 的规则一致）"""
+    import re
+    m = re.search(r"assets/snaps/([^/]+)", path or "")
+    return m.group(1) if m else ""
 
 
-# ─────────────────────────────────────────────────────────── 通用抽取 ──
-def _walk(obj, out):
-    if isinstance(obj, dict):
-        ids = [obj.get(k) for k in ID_KEYS if isinstance(obj.get(k), (str, int))]
-        names = [obj.get(k) for k in NAME_KEYS if isinstance(obj.get(k), str)]
-        if ids and names:
-            types = [str(obj.get(k)) for k in TYPE_KEYS if obj.get(k)]
-            out.append({
-                "id": str(ids[0]),
-                "name": names[0],
-                "type": types[0] if types else "?",
-                "raw": obj,
-            })
-        for v in obj.values():
-            _walk(v, out)
-    elif isinstance(obj, list):
-        for v in obj:
-            _walk(v, out)
+def write_outputs(casino, currency, all_keys, tables, raw_frames, errors):
+    keys_path = os.path.join(HERE, "Server_Keys.txt")
+    with open(keys_path, "w", encoding="utf-8") as f:
+        f.write("# casinoId=%s  currency=%s  %s\n" % (casino, currency, time.strftime("%Y-%m-%d %H:%M:%S")))
+        f.write("# 服务端大厅下发的一条 tableKey 帧，就是该 casino 的全部桌号（未做任何筛选）\n")
+        for k in all_keys:
+            f.write("%s\n" % k)
+
+    def sortkey(item):
+        tid, info = item
+        return (str(info.get("type") or ""), str(info.get("name") or ""))
+
+    out_path = os.path.join(HERE, "All_Tables.txt")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("# casinoId=%s  currency=%s  %s\n" % (casino, currency, time.strftime("%Y-%m-%d %H:%M:%S")))
+        f.write("# 桌名 | 桌号 | snapId | 桌型 | 子类型\n")
+        for tid, info in sorted(tables.items(), key=sortkey):
+            f.write("%s | %s | %s | %s | %s\n" % (info.get("name"), tid, info.get("snap"),
+                                                  info.get("type"), info.get("subtype")))
+
+    raw_path = os.path.join(HERE, "lobby_raw.jsonl")
+    with open(raw_path, "w", encoding="utf-8") as f:
+        for r in raw_frames:
+            f.write(r + "\n")
+
+    return out_path, keys_path, raw_path
 
 
-def extract(text: str):
-    """先当 JSON 抽；抽不到再当「原始帧逐行 JSON」抽。返回去重后的记录列表。"""
-    records = []
-    try:
-        _walk(json.loads(text), records)
-    except Exception:
-        pass
-    if not records:                      # WS 逐行帧
-        for line in text.splitlines():
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    _walk(json.loads(line), records)
-                except Exception:
-                    pass
-    seen, uniq = set(), []
-    for r in records:
-        k = (r["name"], r["id"])
-        if k not in seen:
-            seen.add(k)
-            uniq.append(r)
-    return uniq
+async def main():
+    args = sys.argv[1:]
+    casino = args[0] if len(args) > 0 else DEFAULT_CASINO
+    currency = args[1] if len(args) > 1 else DEFAULT_CURRENCY
+    seconds = float(args[2]) if len(args) > 2 else 20.0
 
+    _log("=" * 70)
+    _log("PP 大厅全量桌号采集（不做桌型筛选）")
+    _log("  casinoId = %s   currency = %s   采集 %ss" % (casino, currency, seconds))
+    _log("=" * 70)
 
-def natural_key(s):
-    return [int(c) if c.isdigit() else c.lower() for c in re.split(r"(\d+)", s)]
+    all_keys, tables, raw_frames, errors, ok = await collect(casino, currency, seconds)
 
+    _log("")
+    _log("  tableKey 全量桌号 : %d" % len(all_keys))
+    _log("  实际回帧的桌      : %d" % len(tables))
+    _log("  错误帧            : %d" % len(errors))
+    if errors:
+        _log("  首个错误: %s" % errors[0][:160])
 
-def save(records):
-    type_counts = {}
-    for r in records:
-        type_counts[r["type"]] = type_counts.get(r["type"], 0) + 1
-    lines = [f"{r['name']} | {r['id']} | {r['type']}" for r in records]
-    OUT_ALL.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-    print(f"\n共 {len(records)} 张桌（**未做任何筛选**）→ {OUT_ALL.name}")
-    print("按类型：" + "  ".join(f"{k}={v}" for k, v in
-                                 sorted(type_counts.items(), key=lambda x: -x[1])))
-    for r in records[:10]:
-        print(f"   {r['name']} | {r['id']} | {r['type']}")
-    if len(records) > 10:
-        print(f"   … 其余 {len(records) - 10} 张见文件")
-    return type_counts
-
-
-def main():
-    ap = argparse.ArgumentParser(description="PP 大厅全量桌号采集（不筛类型）")
-    ap.add_argument("sid", nargs="?", help="JSESSIONID")
-    ap.add_argument("--host", help="指定大厅 host，默认逐个试")
-    ap.add_argument("--ws", action="store_true", help="改走 WebSocket 大厅")
-    ap.add_argument("--ws-seconds", type=float, default=40.0)
-    args = ap.parse_args()
-
-    if args.ws:
-        frames = collect_ws_lobby(args.ws_seconds)
-        text = "\n".join(frames)
-        OUT_RAW.write_text(text, encoding="utf-8")
-        print(f"\n收到 {len(frames)} 帧 → {OUT_RAW.name}")
-        if frames:
-            print("首帧：" + frames[0][:200])
-        recs = extract(text)
-        if recs:
-            save(recs)
-        else:
-            print("\n⚠️ 没抽到任何桌 → 服务端没推数据（可能大厅入口对当前 casino 已失效）")
-            print("   已把原始帧写进 lobby_raw.txt，可据此判读。")
+    if not all_keys:
+        _log("\n  [x] 没拿到 tableKey —— 确认 casinoId 是否正确。")
         return
 
-    if not args.sid:
-        ap.error("需要 JSESSIONID，或用 --ws")
+    by_type = {}
+    for info in tables.values():
+        by_type.setdefault(info.get("type") or "?", []).append(info.get("name"))
+    _log("")
+    _log("  按桌型统计：")
+    for t, names in sorted(by_type.items()):
+        _log("    %-16s %3d 桌   %s" % (t, len(names), ", ".join(sorted(str(n) for n in names))[:90]))
 
-    hosts = [args.host] if args.host else LOBBY_HOSTS
-    print(f"[HTTP 大厅] 试 {len(hosts)} 个 host…")
-    host, body = fetch_http_lobby(args.sid, hosts)
-    if not body:
-        print("\n× 所有 host 都没拿到数据（session 无效 / 已过期）")
-        return
-    OUT_RAW.write_text(body, encoding="utf-8")
-    print(f"\n命中 host = {host}，原文 {len(body)} 字节 → {OUT_RAW.name}")
-    recs = extract(body)
-    if not recs:
-        print("\n⚠️ 拿到响应但没抽出桌子 —— 结构可能和我猜的不一样，")
-        print(f"   先看 {OUT_RAW.name} 的实际结构（文件里是原文，不是我猜的）。")
-        return
-    save(recs)
+    out, keys, raw = write_outputs(casino, currency, all_keys, tables, raw_frames, errors)
+    _log("")
+    _log("  已写出：")
+    _log("    %s" % out)
+    _log("    %s" % keys)
+    _log("    %s" % raw)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    asyncio.run(main())
