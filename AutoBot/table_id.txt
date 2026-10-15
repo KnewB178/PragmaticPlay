@@ -2,6 +2,7 @@ Blackjack 1 | m24f0zhzupicvchc
 Blackjack 2 | 22cm03wwntad3rjv
 Blackjack 3 | tjtrahl9gblxxlkc
 Blackjack 4 | 8li4ycefgbq67uqe
+Blackjack 5 | v8ud3opn87pr3mtl
 Blackjack 6 | mlu2hu6hv0egfxcz
 Blackjack 7 | svs6717sc9512qjb
 Blackjack 8 | z4u19edve6kj103k
@@ -24,17 +25,21 @@ Blackjack 25 | bas2sgk7ph2ybj25
 Blackjack 26 | bas2sgk7ph2ybj26
 Blackjack 28 | bas2sgk7ph2ybj04
 Blackjack 29 | bas2sgk7ph2ybj03
+Blackjack 31 | bas2sgk7ph2ybj01
 Blackjack 32 | bas2sgk7ph2ybj06
 Blackjack 33 | geogamingh2bj141
 Blackjack 34 | geogamingh2bj142
 Blackjack 35 | geogamingh2bj143
 Blackjack 36 | geogamingh2bj144
 Blackjack 38 | bjusbim6hcbj2418
+Blackjack 41 | bjusbim6hcbj2410
+Blackjack 42 | bjusbim6hcbj2411
 Blackjack 46 | bjusbim6hcbj2415
 Blackjack 47 | bjusbim6hcbj2416
 Blackjack 48 | bjusbim6hcmbj246
 Blackjack 49 | bjusbim6hcmbj247
 Blackjack 50 | bjusbim6hcmbj248
+Blackjack 51 | bjusbim6hcmbj249
 Blackjack 52 | sobj215blackjack
 Blackjack 54 | sobj217blackjack
 Blackjack 55 | sobj218blackjack
@@ -49,8 +54,13 @@ Blackjack 70 | sobj267blackjack
 Blackjack 71 | sobj225blackjack
 Blackjack 72 | sobj226blackjack
 Blackjack 74 | sobj228blackjack
+Blackjack 77 | sbjsbim6hsbj2424
+Blackjack 78 | sbjsbim6hsbj2425
 Blackjack 151 | sobj235blackjack
 Blackjack 152 | sobj236blackjack
+Speed Blackjack 1 | sbjsbim6hsbj2421
+Speed Blackjack 2 | sbjsbim6hsbj2422
+Speed Blackjack 3 | sbjsbim6hsbj2423
 Speed Blackjack 6 | sobj212blackjack
 Speed Blackjack 7 | sobj213blackjack
 Speed Blackjack 8 | sobj277blackjack
