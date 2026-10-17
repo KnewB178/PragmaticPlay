@@ -67,7 +67,8 @@ async def heartbeat(ws):
 
 async def listen(feed_url: str, raw_path: Path, csv_path: Path):
     snapshots = {}            # 桌名 → 最新 pp/table 快照
-    seen = set()              # (桌名, 时间, seat, hand, cashOut) 去重
+    seen = {}                 # (桌名, 座位, 手, 牌, cashOut) → 首次出现时间（同一条 offer 会重推）
+    DEDUPE_WINDOW = 300       # 同一手同一价 5 分钟内只记一次（一个回合不会超过它）
     stats = {"raw": 0, "sample": 0, "tables": set()}
     last_report = time.monotonic()
 
@@ -105,11 +106,14 @@ async def listen(feed_url: str, raw_path: Path, csv_path: Path):
                         continue
                     seat = body.get("seatNumber")
                     hand = body.get("hand", "")
-                    t = p.get("time") or datetime.now().strftime("%H:%M:%S")
-                    key = (name, t, seat, hand, co)
-                    if key in seen:
+                    # 同一条 offer 会被服务器/中继重复推，按内容去重（不看时间戳）
+                    dedupe_key = (name, seat, hand,
+                                  tuple(str(c) for c in (body.get("cards") or [])), co)
+                    now_m = time.monotonic()
+                    if now_m - seen.get(dedupe_key, -1e9) < DEDUPE_WINDOW:
                         continue
-                    seen.add(key)
+                    seen[dedupe_key] = now_m
+                    t = p.get("time") or datetime.now().strftime("%H:%M:%S")
 
                     # 对齐最新快照：庄家明牌 / 注金 / 整靴账本
                     snap = snapshots.get(name) or {}
