@@ -38,6 +38,7 @@ from collections import Counter
 VALUES = list(range(1, 11))
 DECKS = 8
 BJ_PAY = 1.2
+DAS = True                       # PP 规则：拆牌后可加倍（EVO 不可）。回滚改 False 即回到 EVO 口径
 SHOE_TOTAL = DECKS * 52          # 416
 LABEL = "PDEV       : "          # 11 字符宽，与 "True Count :" / "Total Card :" 对齐
 
@@ -242,8 +243,14 @@ class EVEngine:
                 per += pv * self.ev_stand(total, up)
             else:
                 t, s = self._step(val, False, v)
-                per += pv * (self.ev_stand(t, up) if t > 21
-                             else max(self.ev_stand(t, up), self.ev_hit(t, s, up)))
+                if t > 21:
+                    per += pv * (-1.0)
+                elif DAS:                      # PP：拆牌后可加倍
+                    per += pv * max(self.ev_stand(t, up),
+                                    self.ev_hit(t, s, up),
+                                    self.ev_double(t, s, up))
+                else:                          # EVO：拆牌后只能 hit/stand
+                    per += pv * max(self.ev_stand(t, up), self.ev_hit(t, s, up))
         return 2 * per
 
     # ── 归一化 ──
@@ -363,14 +370,15 @@ def frame_line(cards):
 
 # ═════════════════════════ 自检基准（从 pdev_local.js 的 EXPECT 抄来，逐帧对账）═════════════════════════
 EXPECT = {
+    # ── DAS 口径（PP 规则：拆后可加倍，2026-10-18 起）──
     "满靴": {
         "cards": [],
-        "pdev": -0.006476944408866543,
+        "pdev": -0.00533082514671704,
         "remaining": 416,
     },
     "6 张 7,K,7,2,2,8": {
         "cards": ["7", "K", "7", "2", "2", "8"],
-        "pdev": -0.005471394935613659,
+        "pdev": -0.00435109497422002,
         "remaining": 410,
     },
     "VIP35 真实帧 129 张": {
@@ -383,10 +391,15 @@ EXPECT = {
                   "8", "3", "T", "8", "4", "A", "T", "T", "8", "9", "A", "5", "8", "T", "3",
                   "3", "T", "3", "T", "8", "3", "5", "T", "7", "2", "7", "2", "T", "9", "T",
                   "T", "6", "4", "T", "6", "T", "2", "5", "T"],
-        "pdev": -0.007095334086665857,
+        "pdev": -0.006040520424947918,
         "remaining": 287,
     },
 }
+
+# ── 旧 EVO 口径基准（DAS=False 时用；回滚参考，勿删）──
+# 满靴            -0.006476944408866543
+# 7,K,7,2,2,8     -0.005471394935613659
+# VIP35 129 张    -0.007095334086665857
 
 
 def selftest():
