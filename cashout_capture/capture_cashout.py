@@ -67,20 +67,24 @@ async def heartbeat(ws):
 
 async def auto_refresh_table(sample_dir: Path, interval=600):
     """每 10 分钟重建一次定价表，挂着就能看到覆盖率和倍数往上走"""
-    script = Path(__file__).with_name("build_table.py")
-    if not script.exists():
+    scripts = [Path(__file__).with_name(n)
+               for n in ("build_table.py", "build_table3.py")]
+    scripts = [s for s in scripts if s.exists()]
+    if not scripts:
         return
     while True:
         await asyncio.sleep(interval)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, str(script), "--dir", str(sample_dir),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL)
-            await asyncio.wait_for(proc.wait(), timeout=120)
-            log("  [🔄] 定价表已刷新（samples/eco_table.csv / .html）")
-        except Exception as e:
-            log(f"  [!] 刷新定价表失败: {e.__class__.__name__}")
+        for script in scripts:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, str(script), "--dir", str(sample_dir),
+                    cwd=str(script.parent),
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL)
+                await asyncio.wait_for(proc.wait(), timeout=120)
+            except Exception as e:
+                log(f"  [!] 刷新 {script.name} 失败: {e.__class__.__name__}")
+        log("  [🔄] 定价表已刷新（eco_table / eco_table3）")
 
 
 async def listen(feed_url: str, raw_path: Path, csv_path: Path):
