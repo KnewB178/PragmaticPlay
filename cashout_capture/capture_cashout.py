@@ -65,11 +65,31 @@ async def heartbeat(ws):
         await asyncio.sleep(60)
 
 
+async def auto_refresh_table(sample_dir: Path, interval=600):
+    """每 10 分钟重建一次定价表，挂着就能看到覆盖率和倍数往上走"""
+    script = Path(__file__).with_name("build_table.py")
+    if not script.exists():
+        return
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, str(script), "--dir", str(sample_dir),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL)
+            await asyncio.wait_for(proc.wait(), timeout=120)
+            log("  [🔄] 定价表已刷新（samples/eco_table.csv / .html）")
+        except Exception as e:
+            log(f"  [!] 刷新定价表失败: {e.__class__.__name__}")
+
+
 async def listen(feed_url: str, raw_path: Path, csv_path: Path):
     snapshots = {}            # 桌名 → 最新 pp/table 快照
     seen = {}                 # (桌名, 座位, 手, 牌, cashOut) → 首次出现时间（同一条 offer 会重推）
     DEDUPE_WINDOW = 300       # 同一手同一价 5 分钟内只记一次（一个回合不会超过它）
-    stats = {"raw": 0, "sample": 0, "tables": set()}
+    raw_sig = {}              # 桌名 → (快照指纹, 上次落盘时刻)
+    RAW_THROTTLE = 30         # 每桌原始帧最短间隔（秒）
+    stats = {"raw": 0, "sample": 0, "tables": set(), "skipped": 0, "throttled": 0}
     last_report = time.monotonic()
 
     raw_f = open(raw_path, "a", encoding="utf-8")
@@ -79,6 +99,7 @@ async def listen(feed_url: str, raw_path: Path, csv_path: Path):
 
     async with websockets.connect(feed_url) as ws:
         hb = asyncio.create_task(heartbeat(ws))
+        refresher = asyncio.create_task(auto_refresh_table(csv_path.parent))
         log("  [✅] Feed connected — recording... (Ctrl+C to stop)")
         try:
             async for raw in ws:
@@ -165,19 +186,39 @@ async def listen(feed_url: str, raw_path: Path, csv_path: Path):
                         f"= {ratio if ratio != '' else '?'}"
                         f"{' ⚠bet可疑' if bet_suspect else ''}")
 
-                # 全量原始帧（两个 topic 都录）
-                raw_f.write(json.dumps(
-                    {"recv": datetime.now().isoformat(timespec="milliseconds"),
-                     "topic": topic, "msg": m}, ensure_ascii=False) + "\n")
-                raw_f.flush()
-                stats["raw"] += 1
+                # 全量原始帧：只在「真的有状态变化」时落盘，且每桌最多 30 秒一帧
+                # （桌面每秒推 30+ 帧，99% 是倒计时；不限流一天能写 8GB）
+                write_raw = True
+                if topic.startswith("pp/table/") and isinstance(body, dict):
+                    sig = (len(body.get("cards") or []),
+                           tuple((body.get("dealer") or {}).get("cards") or []),
+                           body.get("tc"))
+                    tname = topic[len("pp/table/"):]
+                    now_m = time.monotonic()
+                    prev = raw_sig.get(tname)
+                    if prev and prev[0] == sig:
+                        write_raw = False
+                        stats["skipped"] += 1
+                    elif prev and now_m - prev[1] < RAW_THROTTLE:
+                        write_raw = False
+                        stats["throttled"] += 1
+                    else:
+                        raw_sig[tname] = (sig, now_m)
+                if write_raw:
+                    raw_f.write(json.dumps(
+                        {"recv": datetime.now().isoformat(timespec="milliseconds"),
+                         "topic": topic, "msg": m}, ensure_ascii=False) + "\n")
+                    raw_f.flush()
+                    stats["raw"] += 1
 
                 if time.monotonic() - last_report >= 60:
                     last_report = time.monotonic()
-                    log(f"  [··] {stats['raw']} frames | {stats['sample']} samples "
-                        f"| {len(stats['tables'])} tables live")
+                    log(f"  [··] {stats['raw']} frames saved "
+                        f"(跳过重复 {stats['skipped']} / 限流 {stats['throttled']}) "
+                        f"| {stats['sample']} samples | {len(stats['tables'])} tables live")
         finally:
             hb.cancel()
+            refresher.cancel()
             raw_f.close()
             csv_f.close()
     return stats
