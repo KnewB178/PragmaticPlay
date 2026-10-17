@@ -96,31 +96,54 @@ def build(rows):
     return cells, skipped
 
 
+def _int_multiple(v, base):
+    """v 是否 ≈ k × base（k 为 2..6 的整数，即玩家那一手押了多份注）"""
+    if base <= 0:
+        return 0
+    for k in range(2, 7):
+        if abs(v - k * base) <= max(0.02, 0.006 * k):
+            return k
+    return 0
+
+
 def resolve(cell):
-    """定出基础倍数，返回 (倍数, 置信度, 标记列表)"""
+    """定出基础倍数，返回 (倍数, 置信度, 标记列表)
+
+    实测同一格里会混进「多份注」的观测：玩家 double 或分牌后押了 2/3/4 份，
+    但快照的 bet 只记了单份 → cashOut÷bet 会算出 2 倍、3 倍、4 倍。
+    所以先拿最小值当基准，把整数倍观测剥掉，剩下的再做众数。
+    """
     vals = sorted(cell["values"])
     if not vals:
         return None, "empty", []
 
-    flags, base_pool = [], []
-    for v in vals:
-        if any(abs(v - 2 * o) <= DOUBLE_TOL for o in vals if o < v):
-            flags.append("含双倍注观测")
-        else:
-            base_pool.append(v)
-    if not base_pool:
-        base_pool = [vals[0]]
-        flags.append("疑似全为双倍注")
+    flags = []
+    if len(vals) == 1:
+        return vals[0], ("confirmed" if cell["values"][vals[0]] >= CONFIRM_N else
+                         "likely" if cell["values"][vals[0]] >= 2 else "weak"), []
 
-    weighted = Counter()
-    for v in base_pool:
-        weighted[v] += cell["values"][v]
+    base_candidate = vals[0]
+    kept, dropped = [], {}
+    for v in vals:
+        k = _int_multiple(v, base_candidate)
+        if k:
+            dropped[k] = dropped.get(k, 0) + cell["values"][v]
+        else:
+            kept.append(v)
+    if dropped:
+        flags.append("剥离多份注 " + "/".join(f"{k}x×{n}" for k, n in sorted(dropped.items())))
+
+    if not kept:                      # 极端：全部都是多份注
+        kept = [base_candidate]
+        flags.append("疑似全是多份注")
+
+    weighted = Counter({v: cell["values"][v] for v in kept})
     best = weighted.most_common(1)[0][0]
 
-    if len(base_pool) > 1 and max(base_pool) - min(base_pool) > 0.02:
-        flags.append(f"分歧 {min(base_pool)}~{max(base_pool)}")
+    if len(kept) > 1 and max(kept) - min(kept) > 0.02:
+        flags.append(f"分歧 {min(kept)}~{max(kept)}")
 
-    n = sum(cell["values"][v] for v in base_pool)
+    n = sum(cell["values"][v] for v in kept)
     if n >= CONFIRM_N and not any(f.startswith("分歧") for f in flags):
         conf = "confirmed"
     elif n >= 2:
@@ -131,6 +154,29 @@ def resolve(cell):
 
 
 # ---------------------------------------------------------------- 输出
+
+def monotonic_check(grid):
+    """横向校验：同一明牌下，倍数随点数应先升(4-11)、再降(12-16)、再升(17-20)。
+    明显违背的格子标出来——通常是那一格的注金样本集体记错（样本少时容易中招）。
+    """
+    段 = [(4, 11, +1), (12, 16, -1), (17, 20, +1)]
+    suspects = []
+    for dealer in DEALER_KEYS:
+        for lo, hi, direction in 段:
+            prev, prev_s = None, None
+            for score in range(lo, hi + 1):
+                g = grid.get((score, dealer))
+                if not g or g["mult"] is None:
+                    continue
+                if prev is not None:
+                    delta = g["mult"] - prev
+                    if delta * direction < -0.03:      # 方向反了
+                        suspects.append((score, dealer, g["mult"], prev_s, prev))
+                        g["flags"].append(f"违反单调(上格 {prev_s}点={prev:.2f})")
+                        g["conf"] = "suspect"
+                prev, prev_s = g["mult"], score
+    return suspects
+
 
 def collect(cells):
     """统一算一遍，供各输出复用"""
@@ -181,7 +227,7 @@ def print_matrix(grid, min_n=1):
                 line += f"{'·':>9}"
                 continue
             filled += 1
-            mark = "" if g["conf"] == "confirmed" else "*"
+            mark = {"confirmed": "", "suspect": "!"}.get(g["conf"], "*")
             line += f"{g['mult']:>8.2f}{mark}"
         print(line)
     print("-" * 100)
@@ -232,7 +278,7 @@ def write_html(grid, out_path, n_samples):
                 tds.append(f'<td style="background:{bg};color:{fg}" title="无样本">·</td>')
                 continue
             bg, fg = color(g["mult"])
-            tag = "" if g["conf"] == "confirmed" else "°"
+            tag = {"confirmed": "", "suspect": "!"}.get(g["conf"], "°")
             tip = f"{dealer} 明牌 · {g['n']} 条样本 · {g['conf']}"
             if g["flags"]:
                 tip += " · " + "；".join(g["flags"])
@@ -298,6 +344,11 @@ def main():
     rows = load_samples(args.dir)
     cells, _ = build(rows)
     grid = collect(cells)
+    suspects = monotonic_check(grid)
+    if suspects:
+        print(f"[!] 横向校验发现 {len(suspects)} 格违反单调（多为该格注金样本记错）：")
+        for score, dealer, mult, psc, pval in suspects:
+            print(f"    {score} 点 vs {dealer}: {mult:.2f} ← 上格 {psc} 点 {pval:.2f}")
 
     csv_out = os.path.join(args.dir, "eco_table.csv")
     html_out = os.path.join(args.dir, "eco_table.html")
