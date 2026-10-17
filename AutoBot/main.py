@@ -762,26 +762,86 @@ def ask_pasted_jsid():
         return sid, tid
 
 
+# ── 上次输入记忆（Bet / Upper / Lower）───────────────────────────────
+# 存在 exe（或 main.py）同目录的 last_inputs.json；读不到就按「首次」走，绝不报错。
+# 规则：直接回车 = 沿用上次输入的那一项（没有上次 = 该项不带值 / 不设限）
+#       Bet 额外：输入 0 = 用该桌最低限额（auto）
+_LAST_INPUTS = {"bet": None, "upper": None, "lower": None, "loaded": False}
+
+
+def _last_inputs_path() -> Path:
+    base = Path(sys.executable).resolve().parent if _FROZEN else HERE
+    return base / "last_inputs.json"
+
+
+def _load_last_inputs() -> dict:
+    """只读一次；文件坏了 / 不存在 / 没权限 → 全部当 None（= 首次运行）"""
+    if _LAST_INPUTS["loaded"]:
+        return _LAST_INPUTS
+    _LAST_INPUTS["loaded"] = True
+    try:
+        with open(_last_inputs_path(), encoding="utf-8") as f:
+            d = json.load(f) or {}
+        for k in ("bet", "upper", "lower"):
+            v = d.get(k)
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            _LAST_INPUTS[k] = float(v)
+    except Exception:
+        pass
+    return _LAST_INPUTS
+
+
+def _save_last_inputs(**kv):
+    """静默保存：写不进去（只读目录等）就当没有记忆，绝不影响主链路"""
+    _load_last_inputs()
+    _LAST_INPUTS.update(kv)
+    try:
+        with open(_last_inputs_path(), "w", encoding="utf-8") as f:
+            json.dump({k: _LAST_INPUTS[k] for k in ("bet", "upper", "lower")},
+                      f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _fmt_last(v) -> str:
+    """提示行里的上次值：数字 → 1,000；None → none"""
+    return f"{v:,.0f}" if v is not None else "none"
+
+
 def ask_bet_amount() -> int:
-    """读到合法整数注额为止；直接回车 = 用该桌最低限额（自动）"""
-    print("  Enter bet amount (blank = use table minimum):")
+    """读到合法整数注额为止。
+    回车 = 沿用上次注额（没有上次 → 该桌最低限额）；输入 0 = 该桌最低限额（自动）。
+    """
+    last = _load_last_inputs()["bet"]
+    hint = _fmt_last(last) if last else "auto"
+    print(f"  Enter bet amount  (Enter = last: {hint} , 0 = table minimum):")
     while True:
         try:
-            raw = input("  Bet: ").strip()
+            raw = input(f"  Bet [{hint}]: ").strip()
         except EOFError:
             raise RuntimeError("no bet amount entered")
         if not raw:
+            if last:
+                log(f"  [💰] Bet amount: {int(last)} (last used)", Fore.CYAN)
+                return int(last)
             log("  [💰] Bet amount: auto (table minimum)", Fore.CYAN)
+            _save_last_inputs(bet=None)
             return None
         try:
             amt = int(float(raw))
         except ValueError:
             print("  Not a number — enter an integer (e.g. 10):")
             continue
-        if amt <= 0:
-            print("  Must be > 0 — enter again:")
+        if amt < 0:
+            print("  Must be 0 or more (0 = table minimum) — enter again:")
             continue
+        if amt == 0:
+            log("  [💰] Bet amount: auto (table minimum)", Fore.CYAN)
+            _save_last_inputs(bet=None)
+            return None
         log(f"  [💰] Bet amount: {amt} (fixed for every round)", Fore.GREEN)
+        _save_last_inputs(bet=amt)
         return amt
 
 
@@ -798,20 +858,27 @@ def _parse_money(raw):
 
 def ask_balance_limits():
     """
-    余额上限 / 下限（各一条）。回车留空 = 该条不启用。
+    余额上限 / 下限（各一条）。
+    直接回车 = 沿用上次输入的值（从没输过 → 该项不启用 = 不设限）。
     返回 (upper, lower)；两者可为 None。
     规则：上限必须大于下限（相等或反了 → 重问下限）。
     """
-    print("  Enter balance UPPER limit — stop when balance >= it (blank = no upper limit):")
+    last = _load_last_inputs()
+    last_up, last_lo = last["upper"], last["lower"]
+
+    print("  Enter balance UPPER limit — stop when balance >= it")
     upper = None
     while True:
         try:
-            raw = input("  Upper: ").strip()
+            raw = input(f"  Upper [{_fmt_last(last_up)}]: ").strip()
         except EOFError:
             raise RuntimeError("no balance upper limit entered")
+        if not raw:
+            upper = last_up                    # 回车 → 沿用上次（没有上次 = 不设限）
+            break
         v = _parse_money(raw)
         if v == "BAD":
-            print("  Not a number — enter a number (e.g. 3000), or blank to skip:")
+            print("  Not a number — enter a number (e.g. 3000):")
             continue
         upper = v
         break
@@ -820,21 +887,23 @@ def ask_balance_limits():
     else:
         log(f"  [🎚️] Balance upper limit: {upper:,.2f}  (stop when balance >= it)", Fore.GREEN)
 
-    print("  Enter balance LOWER limit — stop when balance <= it (blank = no lower limit):")
+    print("  Enter balance LOWER limit — stop when balance <= it")
     lower = None
+    first = True
     while True:
+        dflt = last_lo if first else None      # 只第一次给上次值，重问时不再默认
         try:
-            raw = input("  Lower: ").strip()
+            raw = input(f"  Lower [{_fmt_last(dflt)}]: ").strip()
         except EOFError:
             raise RuntimeError("no balance lower limit entered")
-        v = _parse_money(raw)
-        if v == "BAD":
-            print("  Not a number — enter a number (e.g. 500), or blank to skip:")
+        first = False
+        lower = dflt if not raw else _parse_money(raw)
+        if lower == "BAD":
+            print("  Not a number — enter a number (e.g. 500):")
             continue
-        if v is not None and upper is not None and v >= upper:
+        if lower is not None and upper is not None and lower >= upper:
             print(f"  Must be smaller than the upper limit ({upper:,.0f}) — enter again:")
             continue
-        lower = v
         break
     if lower is None:
         log("  [🎚️] Balance lower limit: disabled", Fore.CYAN)
@@ -842,7 +911,8 @@ def ask_balance_limits():
         log(f"  [🎚️] Balance lower limit: {lower:,.2f}  (stop when balance <= it)", Fore.GREEN)
 
     if upper is None and lower is None:
-        log("  [🎚️] Balance limits: OFF (both blank) — 不会因余额停止", Fore.CYAN)
+        log("  [🎚️] Balance limits: OFF (both disabled) — 不会因余额停止", Fore.CYAN)
+    _save_last_inputs(upper=upper, lower=lower)
     return upper, lower
 
 
