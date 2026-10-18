@@ -362,6 +362,17 @@ REQUIRE_FEED_BASELINE_ON_RECONNECT = True
 REQUIRE_BASELINE_WAIT = 10       # 重连等基线的上限（秒）
 # ─────────────────────────────────────────────────────────────
 
+# ── ★ 重连机制（粘贴 URL 后可选；这里只是「第一次问」的默认值）──
+#     1 = strict      : 断线重连必须先等 feed 基线（最多 REQUIRE_BASELINE_WAIT 秒），
+#                       拿不到就停（窗口保留）。＝ 旧行为，改回 1 即完全回滚。
+#     2 = carry-over  : 断线重连不等 feed 基线、也不清零，直接沿用断开前那一刻的
+#                       鞋级账本（已出牌清单 / TC / 座位号）接着下注。
+#                       只搬「鞋」不搬「局」：局内手牌、庄家明牌、待确认注都从新帧重建。
+#     选过一次就记在 last_inputs.json，下次回车 = 上次选的那个。
+RECONNECT_MODE_DEFAULT = 2
+RECONNECT_MODES = {1: "strict", 2: "carry-over"}
+# ─────────────────────────────────────────────────────────────
+
 # ── TC 数据源「网络端」(relay feed, pp.knewb2u.com) 开关 ──
 #     True  = 正常行为：连 feed 拿「这张桌已出牌」的现成快照当 TC 基线
 #     False = 完全停用网络端：不做任何 feed 连接；连上桌后直接无基线接管（TC 从 0 起算）
@@ -385,7 +396,7 @@ USE_BALANCE_LIMIT = True
 #     True  = 平滑重绘（推荐）
 #     False = 旧行为（清屏重画）
 UI_SMOOTH_RENDER = True
-PANEL_MIN_LINES = 33     # 面板行数 + 余量；窗口低于这个值就尝试调高
+PANEL_MIN_LINES = 36     # 面板行数 + 余量；窗口低于这个值就尝试调高
 EVENTS_ROWS = 8          # 「Recent events」固定占几行（不足补空行 → 帧高恒定，避免残影）
 # ─────────────────────────────────────────────────────────────
 
@@ -522,6 +533,7 @@ UI = {
     "active": False,            # 进入主循环后才整屏渲染（之前正常逐行打印）
     "table": "—", "min_bet": None, "my_seat": None,
     "feed": "connecting…" if USE_FEED else "off (feed disabled)", "login": "",
+    "reconnect": "",            # 本次运行选的重连机制（strict / carry-over）
     "balance": None,            # 余额（HTTP 轮询）
     "currency": "MYR",
     "conn_secs": 0.0,           # 这张桌的已连接时长（秒）
@@ -534,6 +546,17 @@ UI = {
     "me_hands": ["", ""],       # 我这两手牌的文字（板面 hand1 / hand2）
     "ev": "", "action": "",
     "events": deque(maxlen=10),
+}
+
+# ── carry-over 用的「鞋级账本」：断线那一刻的最后状态（只在进程内有效）──
+#     report_tc() 每次牌变都会同步一份，所以它永远是「最后一次已知」的账本。
+#     程序重启 / 换新 URL → CARRY 清空 → 回到从 0 起算（与旧行为一致）。
+CARRY = {
+    "table": None,      # 桌名（只接同一张桌）
+    "cards": None,      # 整个 shoe 已出牌（字符串列表；None = 还没接管过）
+    "tc": 0.0,
+    "seat": None,       # 上次坐的座位号（str）；被占就随便找空位
+    "ts": None,         # 记录时间（面板/日志用）
 }
 
 
@@ -644,6 +667,7 @@ def render():
                  Fore.RED),
              row(f"{'State':<9} : STOPPED — {UI['stopped']}", Fore.RED),
              row(f"{'Feed':<9} : {UI['feed']}"),
+             row(f"{'Reconnect':<9} : {UI['reconnect'] or '—'}"),
              row(f"{'Login':<9} : {UI['login']}"),
              "├" + bar + "┤",
              row(f"Shoe {UI['shoe_n']}/{SHOE_TOTAL}   {taken_txt}   TC {UI['tc']:+.2f}",
@@ -667,6 +691,7 @@ def render():
              row(f"{'Connected':<9} : {_hms(UI['conn_secs'])}", Fore.MAGENTA),
              row(f"{'State':<9} : running", Fore.GREEN),
              row(f"{'Feed':<9} : {UI['feed']}"),
+             row(f"{'Reconnect':<9} : {UI['reconnect'] or '—'}"),
              row(f"{'Login':<9} : {UI['login']}"),
              "├" + bar + "┤",
              row(f"Shoe {UI['shoe_n']}/{SHOE_TOTAL}   {taken_txt}   TC {UI['tc']:+.2f}",
@@ -766,7 +791,7 @@ def ask_pasted_jsid():
 # 存在 exe（或 main.py）同目录的 last_inputs.json；读不到就按「首次」走，绝不报错。
 # 规则：直接回车 = 沿用上次输入的那一项（没有上次 = 该项不带值 / 不设限）
 #       Bet 额外：输入 0 = 用该桌最低限额（auto）
-_LAST_INPUTS = {"bet": None, "upper": None, "lower": None, "loaded": False}
+_LAST_INPUTS = {"bet": None, "upper": None, "lower": None, "mode": None, "loaded": False}
 
 
 def _last_inputs_path() -> Path:
@@ -782,9 +807,13 @@ def _load_last_inputs() -> dict:
     try:
         with open(_last_inputs_path(), encoding="utf-8") as f:
             d = json.load(f) or {}
-        for k in ("bet", "upper", "lower"):
+        for k in ("bet", "upper", "lower", "mode"):
             v = d.get(k)
             if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            if k == "mode":
+                if int(v) in RECONNECT_MODES:      # 只认 1 / 2，别的当没选过
+                    _LAST_INPUTS[k] = int(v)
                 continue
             _LAST_INPUTS[k] = float(v)
     except Exception:
@@ -797,9 +826,11 @@ def _save_last_inputs(**kv):
     _load_last_inputs()
     _LAST_INPUTS.update(kv)
     try:
+        out = {k: _LAST_INPUTS[k] for k in ("bet", "upper", "lower", "mode")}
+        if out.get("mode") is not None:
+            out["mode"] = int(out["mode"])         # 存成整数，读回来好校验
         with open(_last_inputs_path(), "w", encoding="utf-8") as f:
-            json.dump({k: _LAST_INPUTS[k] for k in ("bet", "upper", "lower")},
-                      f, ensure_ascii=False)
+            json.dump(out, f, ensure_ascii=False)
     except Exception:
         pass
 
@@ -913,6 +944,37 @@ def ask_balance_limits():
     if upper is None and lower is None:
         log("  [🎚️] Balance limits: OFF (both disabled) — 不会因余额停止", Fore.CYAN)
     _save_last_inputs(upper=upper, lower=lower)
+
+
+def ask_reconnect_mode() -> int:
+    """断线后怎么重连：1 = 先等 feed 基线（旧行为）；2 = 沿用上次鞋级账本直接跑。
+
+    回车 = 上次选过的（没有上次 = RECONNECT_MODE_DEFAULT，当前是 2）。
+    """
+    last = _load_last_inputs().get("mode") or RECONNECT_MODE_DEFAULT
+    hint = f"{last} = {RECONNECT_MODES[last]}"
+    print("  Reconnect mode  (1 = strict baseline , 2 = carry over last shoe):")
+    while True:
+        try:
+            raw = input(f"  Reconnect [{hint}]: ").strip()
+        except EOFError:
+            raise RuntimeError("no reconnect mode entered")
+        if not raw:
+            mode = last
+        elif raw in ("1", "2"):
+            mode = int(raw)
+        else:
+            print("  Only 1 or 2 — enter again:")
+            continue
+        break
+    if mode == 2:
+        log("  [♻️] Reconnect mode: carry-over — 断线后直接用上次的鞋账本重连 "
+            "(不等 feed 基线)", Fore.GREEN)
+    else:
+        log(f"  [📡] Reconnect mode: strict — 断线重连必须先拿到 feed 基线 "
+            f"(最多 {int(REQUIRE_BASELINE_WAIT)}s，拿不到就停)", Fore.GREEN)
+    _save_last_inputs(mode=mode)
+    return mode
     return upper, lower
 
 
@@ -1354,7 +1416,11 @@ import certifi as _certifi
 _WSS_SSL = _ssl.create_default_context(cafile=_certifi.where())
 
 
-async def listen_table(name: str, url: str, min_bet, bet_amount=None):
+async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=None):
+    """carry_in = 上一趟断开时留下的鞋级账本（只给 carry-over 机制用）：
+       {"cards": [...], "tc": x, "seat": "3"}
+       有它 → 接管时直接拿它当基线，不再等 feed；没有 → 走原有逻辑。
+    """
     ch_holder = {"ch": name}  # 默认用桌名；subscribe 确认到达后改用服务器给的 channel
     occupied = {}             # 座位号(str) → 玩家名；非 sit 事件视为起身让位
     reported = {"init": False}
@@ -1400,6 +1466,13 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None):
         UI["taken"] = True
         UI["cards"] = [str(c) for c in shoe.cards]
         update_pdev(shoe.cards)          # 除 TC 外同步算 PDEV（同一份已出牌账本，不用另开）
+        # 同步一份「鞋级账本」到 CARRY：断线那一秒它就是最后状态，
+        # carry-over 重连时直接拿它接着算。
+        CARRY["table"] = name
+        CARRY["cards"] = list(shoe.cards)
+        CARRY["tc"] = shoe.tc
+        CARRY["seat"] = my_seat["v"]
+        CARRY["ts"] = time.strftime("%H:%M:%S")
         render()
 
     async with websockets.connect(url, ssl=_WSS_SSL if url.startswith("wss") else None) as ws:
@@ -1419,7 +1492,13 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None):
                 log("  [🪑] No free seat — disconnecting (not blacklisted)", Fore.YELLOW)
                 await ws.close()
                 return "no free seat at this table"
-            seat = random.choice(empty)
+            # carry-over：上次坐的位子还空着就回原位（只换座位不改逻辑）
+            pref = (carry_in or {}).get("seat")
+            if pref is not None and str(pref) in empty:
+                seat = str(pref)
+                log(f"  [♻️] Reusing last seat {seat_disp(seat)} (carry-over)", Fore.CYAN)
+            else:
+                seat = random.choice(empty)
             await ws.send(_sitdown(ch_holder["ch"], seat))
             my_seat["v"] = seat
             UI["my_seat"] = seat
@@ -1565,7 +1644,21 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None):
                             f"treated as rejected, blacklisting table", Fore.RED)
                         return "previous bet not confirmed"
                     if not taken["v"]:
-                        snap = snap_map.get(name)
+                        snap = None
+                        if carry_in and carry_in.get("cards") is not None:
+                            # carry-over：直接接上断开前的鞋账本（不等 feed）
+                            shoe.load_baseline(carry_in["cards"])
+                            taken["v"] = True
+                            log(f"  [♻️] Carry-over takeover | resumed {len(shoe.cards)} cards, "
+                                f"TC {shoe.tc:+.2f} (saved {carry_in.get('ts') or '?'}) — "
+                                f"counting continues from here", Fore.MAGENTA)
+                            report_tc()
+                            if feed_ctl["want"]:
+                                feed_pause()
+                                log("  [📴] Carry-over in use — feed not needed, disconnected",
+                                    Fore.CYAN)
+                        else:
+                            snap = snap_map.get(name)
                         if snap:
                             shoe.load_baseline(snap.get("cards"))
                             taken["v"] = True
@@ -1576,7 +1669,7 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None):
                                 feed_pause()   # 基线到手 → 暂停收 feed，之后全靠本地自算
                                 log("  [📴] Baseline received — feed disconnected "
                                     "(local TC from now, auto re-attach)", Fore.CYAN)
-                        elif TAKEOVER_WITHOUT_BASELINE:
+                        elif not taken["v"] and TAKEOVER_WITHOUT_BASELINE:
                             # 没有 feed 基线（粘的桌号不在 table_id.txt）→ 连上即开始算：
                             # 从这一刻（0 张）起累计，收到洗牌信号照样清零
                             shoe.clear()
@@ -1588,7 +1681,7 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None):
                             if feed_ctl["want"]:
                                 feed_pause()
                                 log("  [📴] No snapshot for this table — feed disconnected", Fore.CYAN)
-                        else:
+                        elif not taken["v"]:
                             log("  [⏳] No feed snapshot for this table yet — not taking over this round", Fore.YELLOW)
                     elif (voip["detected"] and voip["after"]) or voip["pending"]:
                         shoe.clear()
@@ -1851,6 +1944,10 @@ async def main():
     balance_limit["upper"] = upper
     balance_limit["lower"] = lower
 
+    # 断线后怎么重连（1 = 严格等基线，2 = 沿用上次鞋账本直接跑）
+    reconnect_mode = ask_reconnect_mode()
+    UI["reconnect"] = RECONNECT_MODES.get(reconnect_mode, "?")
+
     if USE_FEED:
         feed = asyncio.create_task(feed_task())
     else:
@@ -1867,7 +1964,8 @@ async def main():
 
     while True:
         # 需要新基线 → 把 TC 数据源接回来；旧快照清掉（防止拿上一次的旧账当新基线）
-        feed_ctl["want"] = USE_FEED     # 停用网络端时保持关闭，永不重连
+        # carry-over 重连不需要基线 → 不接 feed（省一次连上又断开）
+        feed_ctl["want"] = USE_FEED and not (need_baseline and reconnect_mode == 2)
         snap_map.clear()
         tc_map.clear()
         if USE_PASTED_TABLE:
@@ -1885,8 +1983,8 @@ async def main():
             table_id = tables[name]
 
         # ★ 重连门禁：必须先从 feed 拿到这张桌的基线（已出牌 + TC）才允许重连；
-        #   拿不到 → 停止（窗口保留）。首次连接 / 换了新 URL 不走这里。
-        if need_baseline and REQUIRE_FEED_BASELINE_ON_RECONNECT:
+        #   拿不到 → 停止（窗口保留）。首次连接 / 换了新 URL / carry-over 不走这里。
+        if need_baseline and REQUIRE_FEED_BASELINE_ON_RECONNECT and reconnect_mode == 1:
             UI["active"] = True
             UI["stopped"] = ""
             UI["action"] = (f"waiting for feed baseline… "
@@ -1902,6 +2000,19 @@ async def main():
                 f"(feed ts {snap.get('timestamp')}) — proceeding to reconnect", Fore.GREEN)
             UI["action"] = f"baseline OK ({n} cards) — connecting…"
             render()
+
+        # ♻️ carry-over：同一张桌、且断开前已经接管过 → 直接拿那份鞋账本当基线
+        #    （换桌 / 从没接管过 → None，连上后按 TAKEOVER_WITHOUT_BASELINE 从 0 起算）
+        carry_in = None
+        if (need_baseline and reconnect_mode == 2
+                and CARRY.get("table") == name and CARRY.get("cards") is not None):
+            carry_in = {"cards": list(CARRY["cards"]), "tc": CARRY["tc"],
+                        "seat": CARRY.get("seat"), "ts": CARRY.get("ts")}
+            log(f"  [♻️] Carry-over: resuming '{name}' with {len(carry_in['cards'])} cards, "
+                f"TC {carry_in['tc']:+.2f} (saved {carry_in['ts'] or '?'}) — no feed wait",
+                Fore.MAGENTA)
+        elif need_baseline and reconnect_mode == 2:
+            log("  [♻️] Carry-over: no saved shoe for this table — starting from 0", Fore.YELLOW)
 
         try:
             url, min_bet = await asyncio.to_thread(build_ws_url, sid, table_id)
@@ -1923,15 +2034,16 @@ async def main():
             continue
 
         # 板面：新一桌信息 + 重置本局/牌靴区
+        # carry-over 有账本时：牌靴区不清零，直接显示接着算的数值（等 betsopen 正式接管）
         UI["active"] = True
         UI["table"] = name
         UI["min_bet"] = min_bet
         UI["my_seat"] = None
         UI["taken"] = False
         UI["stopped"] = ""            # 新一轮连接 → 清掉上一次的停止标记
-        UI["shoe_n"] = 0
-        UI["tc"] = 0.0
-        UI["cards"] = []
+        UI["shoe_n"] = len(carry_in["cards"]) if carry_in else 0
+        UI["tc"] = carry_in["tc"] if carry_in else 0.0
+        UI["cards"] = [str(c) for c in carry_in["cards"]] if carry_in else []
         UI["scores"] = {}
         UI["occupy"] = {}
         UI["me_hands"] = ["", ""]
@@ -1947,7 +2059,7 @@ async def main():
         limit_stop = ""
         exit_reason = ""
         try:
-            reason = await listen_table(name, url, min_bet, bet_amount)
+            reason = await listen_table(name, url, min_bet, bet_amount, carry_in=carry_in)
             if reason:
                 if reason.startswith("STOP:"):
                     limit_stop = reason[5:]      # 余额上下限 → 无条件停止（与断线开关无关）
