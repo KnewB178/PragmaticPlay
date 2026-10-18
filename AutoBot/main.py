@@ -232,7 +232,7 @@ calc_ev = _ev_mod.calc_ev
 
 # PDEV 本地引擎（EVO 同款）—— pdev_local.py 是 pdev_local.js 的逐帧等价移植。
 # 除 TC 外再多算一个 composition-dependent 的精准期望值。
-# 口径：老板口径（明牌 A 只归一化不扣 BJ）· BJ 赔付 1.2 · S17 · 明牌 10 无 peek · 不含 ECU。
+# 口径：老板口径（明牌 A 只归一化不扣 BJ）· BJ 赔付 1.2 · S17 · 明牌 10 无 peek · 含 ECU（cashout 第 5 候选，定价表在 pdev_local.ECO_RATES）。
 _pdev_spec = importlib.util.spec_from_file_location("pdev_local", ROOT / "pdev_local.py")
 _pdev_mod = importlib.util.module_from_spec(_pdev_spec)
 _pdev_spec.loader.exec_module(_pdev_mod)
@@ -539,7 +539,7 @@ UI = {
     "conn_secs": 0.0,           # 这张桌的已连接时长（秒）
     "stopped": "",              # 非空 = 已停止（显示 STOPPED 原因）
     "shoe_n": 0, "tc": 0.0, "taken": False,
-    "pdev": None, "pdev_issued": None,   # PDEV（不含 ECU）；None = 还没算出来
+    "pdev": None, "pdev_issued": None,   # PDEV（含 ECU）；None = 还没算出来
     "round": "—", "dealer": "—",
     "occupy": {},               # 座位 → 玩家名（连接期间）
     "scores": {},               # 本局: 座位 → 点数（暂不上屏，留着方便恢复）
@@ -610,7 +610,7 @@ def _pdev_color() -> str:
 
 
 def update_pdev(cards):
-    """按整靴已出牌算 PDEV（不含 ECU）。
+    """按整靴已出牌算 PDEV（含 ECU）。
     引擎自带 128 份余牌组成缓存 —— 同一状态重复算几乎零成本（实测 ~9ms/次）。
     出任何问题都只让板面显示「—」，绝不打断主流程。"""
     try:
