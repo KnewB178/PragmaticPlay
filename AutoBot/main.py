@@ -652,7 +652,8 @@ def render():
 
 
 
-    taken_txt = "taken · local TC" if UI["taken"] else "waiting for snapshot"
+    taken_txt = ("taken · local TC" if UI["taken"]
+                 else ("carry-over · pending" if UI["shoe_n"] else "waiting for snapshot"))
 
     if UI.get("stopped"):
         L = ["┌" + bar + "┐",
@@ -944,6 +945,7 @@ def ask_balance_limits():
     if upper is None and lower is None:
         log("  [🎚️] Balance limits: OFF (both disabled) — 不会因余额停止", Fore.CYAN)
     _save_last_inputs(upper=upper, lower=lower)
+    return upper, lower
 
 
 def ask_reconnect_mode() -> int:

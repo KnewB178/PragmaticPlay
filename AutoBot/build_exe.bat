@@ -30,6 +30,7 @@ echo [2/2] Building ...
     --workpath "%~dp0build" ^
     --specpath "%~dp0build" ^
     --add-data "%~dp0PP EV.py;." ^
+    --add-data "%~dp0pdev_local.py;." ^
     --add-data "%~dp0table_id.txt;." ^
     --add-data "%~dp0bot_config.ini;." ^
     "%~dp0main.py"
