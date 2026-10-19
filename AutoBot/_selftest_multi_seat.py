@@ -52,6 +52,12 @@ def bets(ws):
             for m in [re.search(r'<bet seat="(\d+)"', s)] if m]
 
 
+def decisions(ws):
+    """→ [(座位号, 手号)]"""
+    return [(m.group(1), m.group(2)) for s in ws.sent
+            for m in [re.search(r'<decision[^>]*seatNum="(\d+)"[^>]*hand="(\d)"', s)] if m]
+
+
 def card(code):
     """伪造一张牌：scanCode 首字符 0→10 / 1→A / 其余按面值"""
     return {"scanCode": code}
@@ -164,6 +170,55 @@ async def run_fixed():
     print("\n✅ 全部通过")
 
 
+async def run_multi_decision():
+    """三座位同一局同时收到 decisionOffer（三个 id 完全相同）→ 必须各发一条 decision"""
+    ws = FakeWS()
+    main.websockets.connect = lambda *a, **k: _Conn(ws)
+    main.SEAT_MODE["v"] = main.SEAT_MODE_PDEV
+    main.BET_DELAY_MIN = main.BET_DELAY_MAX = 0.2
+    main.ACTION_DELAY_MIN = main.ACTION_DELAY_MAX = 0.15
+    main.UI["active"] = False
+    main.UI["pdev"] = 0.02
+    main.update_pdev = lambda cards: main.UI.update({"pdev": 0.02, "pdev_issued": "test"})
+    main.choose_action = lambda *a, **k: ("h", [{"decision": "Hit", "ev": 0.01}])
+    carry = {"cards": ["2"] * 40, "tc": 2.0, "seat": None}
+
+    task = asyncio.create_task(main.listen_table("TEST3", "wss://x/y", 10, 10, carry))
+    ws.push({"subscribe": {"channel": "table-test3"}})
+    await asyncio.sleep(3.4)
+    first = sitdowns(ws)[0]
+    ws.push({"seat": {"num": first, "event": "sit", "user_id": "U1", "screen_name": "me"}})
+    await asyncio.sleep(0.2)
+    ws.push({"betsopen": {"game": "m1"}})
+    await asyncio.sleep(0.8)
+    seats = sitdowns(ws)
+    for s in seats:
+        ws.push({"seat": {"num": s, "event": "sit", "user_id": "U1", "screen_name": "me"}})
+    await asyncio.sleep(0.3)
+    ws.push({"playerSeat": {"seatNumber": -1, "gameId": "m1",
+                            "h0": {"cards": [card("5H")], "score": 5}}})
+    await asyncio.sleep(0.1)
+    for s in seats:
+        ws.push({"playerSeat": {"seatNumber": s, "gameId": "m1",
+                                "h0": {"cards": [card("5H"), card("7S")], "score": 12,
+                                       "activeHand": True,
+                                       "decisionOffer": {"id": "OFFER-1",
+                                                         "canDouble": True,
+                                                         "canSplit": False}}}})
+        await asyncio.sleep(0.05)
+
+    await asyncio.sleep(1.2)
+    got = decisions(ws)
+    print("⑨ 三座位（offer id 完全相同）收到的 decision:", got)
+    assert len(got) == 3, f"三个座位应各发一条 decision，实际 {len(got)}"
+    assert sorted(s for s, _ in got) == sorted(str(s) for s in seats), \
+        f"座位号应各一条，实际 {got}"
+
+    ws.stop()
+    await asyncio.wait_for(task, timeout=5)
+    print("\n✅ 全部通过")
+
+
 class _Conn:
     def __init__(self, ws):
         self.ws = ws
@@ -179,6 +234,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(run())
         asyncio.run(run_fixed())
+        asyncio.run(run_multi_decision())
     except AssertionError as e:
         print("\n❌", e)
         sys.exit(1)

@@ -561,6 +561,7 @@ UI = {
     "occupy": {},               # 座位 → 玩家名（连接期间）
     "scores": {},               # 本局: 座位 → 点数（暂不上屏，留着方便恢复）
     "me_hands": ["", ""],       # 我这两手牌的文字（板面 hand1 / hand2）
+    "seat_hands": {},           # 多座位时：座位号 → 该座位本局手牌文字（每座位一行）
     "ev": "", "action": "",
     "events": deque(maxlen=10),
 }
@@ -677,6 +678,23 @@ def render():
     taken_txt = ("taken · local TC" if UI["taken"]
                  else ("carry-over · pending" if UI["shoe_n"] else "waiting for snapshot"))
 
+    seats_now = UI["my_seat"] if isinstance(UI["my_seat"], list) else []
+
+    def me_rows():
+        """「Me」区块：单座位 = hand1/hand2（原样）；多座位 = 每个座位一行，最多 MAX_SEATS_PER_TABLE 行"""
+        out = [row("Me")]
+        if len(seats_now) > 1:
+            order = sorted(seats_now, key=lambda x: int(x))
+            for s in order:
+                out.append(row(f"{'S' + seat_disp(s):<9} : "
+                               f"{UI['seat_hands'].get(s, '')}".rstrip()))
+            for _ in range(MAX_SEATS_PER_TABLE - len(order)):
+                out.append(row(f"{'':<9}   ".rstrip()))      # 补齐 → 行数恒定，不跳动
+            return out
+        out.append(row(f"{'hand1':<9} : {UI['me_hands'][0]}".rstrip()))
+        out.append(row(f"{'hand2':<9} : {UI['me_hands'][1]}".rstrip()))
+        return out
+
     if UI.get("stopped"):
         L = ["┌" + bar + "┐",
              row("PP AutoBot"),
@@ -699,10 +717,7 @@ def render():
              row(f"{'PDEV':<9} : {_pdev_txt()}", _pdev_color()),
              "├" + bar + "┤",
              row(f"{'GameID':<9} : {UI['round']}"),
-             row(f"{'Dealer':<9} : {UI['dealer']}"),
-             row("Me"),
-             row(f"{'hand1':<9} : {UI['me_hands'][0]}".rstrip()),
-             row(f"{'hand2':<9} : {UI['me_hands'][1]}".rstrip())]
+             row(f"{'Dealer':<9} : {UI['dealer']}")] + me_rows()
     else:
         L = ["┌" + bar + "┐",
              row("PP AutoBot"),
@@ -724,10 +739,7 @@ def render():
              row(f"{'PDEV':<9} : {_pdev_txt()}", _pdev_color()),
              "├" + bar + "┤",
              row(f"{'GameID':<9} : {UI['round']}"),
-             row(f"{'Dealer':<9} : {UI['dealer']}"),
-             row("Me"),
-             row(f"{'hand1':<9} : {UI['me_hands'][0]}".rstrip()),
-             row(f"{'hand2':<9} : {UI['me_hands'][1]}".rstrip())]
+             row(f"{'Dealer':<9} : {UI['dealer']}")] + me_rows()
     L.append(row(f"{'EV':<9} : {UI['ev']}".rstrip()))
     L.append(row(f"{'Action':<9} : {UI['action']}".rstrip()))
     L += ["└" + bar + "┘",
@@ -1494,8 +1506,10 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
     #                    待确认 gid（座位→gid）/ 本局已押 / 延时任务 / 本局主注额 / 最近一次确认过的 gid
 
     dealer = {"cards": []}    # 庄家已知牌（h0，第一张即明牌），供 EV 使用
-    acted = set()             # 已提交过的 decisionOffer.id（同一条 offer 只动作一次）
-    dec_tasks = {}            # offer.id → 延时动作任务
+    acted = set()             # 已提交过的动作 (座位号, decisionOffer.id)，同一格只动作一次
+    dec_tasks = {}            # (座位号, offer.id) → 延时动作任务
+    last_ps = {}             # 座位号 → 本局该座位最新的 playerSeat 帧（多座位兜底重扫用）
+    dec_lock = asyncio.Lock()  # 决策发送闸门：多座位时轮流提交，不并发
     seen_dec = set()          # 已打印过的动作回执（去重）
     ins = {"done": None}      # 本局保险是否已回应（按 gameId 记）
 
@@ -1677,11 +1691,17 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                 # 只有真正轮到我这一手才动作（纯预告帧 activeHand=false 且无 decisionTimer）
                 if not (hand.get("activeHand") is True or "decisionTimer" in hand):
                     continue
+                # ★ 去重 key 必须带座位号：三个座位同一局同一手序（都是 h0）时，
+                #   服务器给的 decisionOffer.id 可能相同 → 用 id 单独去重会把第 2、3 个位挡掉
                 oid = str(offer.get("id") or "")
-                if not oid or oid in acted:
+                key = (seat, oid)
+                if not oid or key in acted:
                     continue          # 同一条 offer（含重播）只动作一次
-                acted.add(oid)
-                dec_tasks[oid] = asyncio.create_task(
+                acted.add(key)
+                if len(my_seat["v"]) > 1:
+                    log(f"  [🎯] Offer: seat {seat_disp(seat)} hand {hand_disp(hkey[1:])} "
+                        f"id={oid}", Fore.CYAN)
+                dec_tasks[key] = asyncio.create_task(
                     act_later(gid, seat, hkey[1:], hand, offer))
 
         async def act_later(gid, seat, hand_idx, hand, offer):
@@ -1706,7 +1726,12 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                 return
 
             try:
-                await ws.send(_decision(ch_holder["ch"], gid, my_uid["v"], seat, hand_idx, dec))
+                # 多座位：按座位轮流提交（同一毫秒并发发 3 条，服务器可能只认当前这个位）
+                async with dec_lock:
+                    await ws.send(_decision(ch_holder["ch"], gid, my_uid["v"],
+                                            seat, hand_idx, dec))
+                    if len(my_seat["v"]) > 1:
+                        await asyncio.sleep(0.25)
             except Exception:
                 return
             evtxt = " | ".join(f'{x["decision"]} {x["ev"]:+.4f}' for x in ordered)
@@ -1782,6 +1807,7 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     UI["scores"] = {}
                     UI["dealer"] = "—"
                     UI["me_hands"] = ["", ""]
+                    UI["seat_hands"] = {}
                     UI["ev"] = ""
                     UI["action"] = ""
                     UI["events"].clear()
@@ -1909,7 +1935,32 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                             f"seat {seat_disp(seat_no)} got cards)", Fore.GREEN)
                     # 我们座位：轮到我 → 排动作；并打印动作回执（服务器确认我们这手做了什么）
                     if _mine(seat_no):
+                        last_ps[str(seat_no)] = ps
+                        # 多座位：这个座位本局的手牌（每座位一行；正在行动的手加 *）
+                        if len(my_seat["v"]) > 1:
+                            parts = []
+                            for hk2 in sorted(k for k in ps if k.startswith("h") and len(k) == 2):
+                                hh2 = ps.get(hk2)
+                                if not isinstance(hh2, dict):
+                                    continue
+                                cs2 = _hand_cards(hh2)
+                                if cs2:
+                                    mark = "*" if hh2.get("activeHand") is True else ""
+                                    parts.append(f"{hh2.get('score', '?')}{mark}"
+                                                 f"({' '.join(cs2)})")
+                            if parts:
+                                UI["seat_hands"][str(seat_no)] = " | ".join(parts)
                         schedule_decision(ps, str(seat_no))
+                        # 多座位兜底：服务器有时只在某一座位的帧里带整桌状态 →
+                        # 顺手把其它我方座位缓存的「同一局」状态也重扫一遍（靠 (座位,id) 去重）
+                        if len(my_seat["v"]) > 1:
+                            for s2 in list(my_seat["v"]):
+                                if s2 == str(seat_no):
+                                    continue
+                                p2 = last_ps.get(s2)
+                                if (isinstance(p2, dict)
+                                        and str(p2.get("gameId")) == str(ps.get("gameId"))):
+                                    schedule_decision(p2, s2)
                         for hkey in sorted(k for k in ps if k.startswith("h") and len(k) == 2):
                             hh = ps.get(hkey)
                             if not isinstance(hh, dict):
@@ -1923,14 +1974,16 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                             cd = hh.get("currentDecision")
                             if (hh.get("currentDecisionAction") in ("playerDecision", "systemCall")
                                     and cd):
-                                sig = (str(ps.get("gameId")), hkey, cd,
+                                sig = (str(seat_no), str(ps.get("gameId")), hkey, cd,
                                        len(hh.get("cards") or []))
                                 if sig not in seen_dec:
                                     seen_dec.add(sig)
                                     UI["action"] = (f"{cd} confirmed by server "
-                                                    f"(hand {hand_disp(hkey[1:])})")
+                                                    f"(seat {seat_disp(seat_no)} "
+                                                    f"hand {hand_disp(hkey[1:])})")
                                     log(f"  [✅] Action confirmed: {cd} "
-                                        f"(hand {hand_disp(hkey[1:])})", Fore.GREEN)
+                                        f"(seat {seat_disp(seat_no)} "
+                                        f"hand {hand_disp(hkey[1:])})", Fore.GREEN)
                         render()
                     continue
 
