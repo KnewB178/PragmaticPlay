@@ -1658,35 +1658,61 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     Fore.MAGENTA)
 
         async def place_bet_later(gid):
-            """开局后随机延时 3-5 秒 → 对每个「已确认」座位各发一次主注。
-            ★ 不再一遇到「座位还没确认 / uid 还没拿到」就直接放弃：
-              每 0.5 秒扫一次，最多 6 秒。这样补坐的位晚一点确认，也能在同一局补上下注。
+            """每个座位各自随机延时 3-5 秒再下注 —— 当成三个互不相干的玩家。
+            座椅 A / B / C 各自有自己的一次随机延时，谁先到点谁先发，互不等待。
+            座位晚确认也能补上：确认那一刻只要它自己的延时已过，立刻发。
             """
-            await asyncio.sleep(random.uniform(BET_DELAY_MIN, BET_DELAY_MAX))
             amt = bet_amount if bet_amount else (min_bet or FALLBACK_BET)
-            for attempt in range(8):             # 3-5s 之后再扫 4 秒（发牌就不能再下注了）
+            t0 = time.monotonic()
+            delay_of = {}                       # 座位 → 这个位自己的随机延时（秒）
+            deadline = t0 + BET_DELAY_MAX + 4   # 最晚等到「最长延时 + 4 秒」
+            warned = [False]
+
+            while True:
+                now = time.monotonic()
                 if bet["last_gid"] != gid:
                     if bet["sent_gid"] != gid:
                         log(f"  [⚠️] Bet skipped — game {gid} already replaced by "
                             f"{bet['last_gid']} before we could send", Fore.YELLOW)
                     return
-                if str(bet["ok_gid"]) == str(gid):
-                    return                       # 本局已经发牌 → 下注窗口关了，不能再补
-                if my_uid["v"] is None or not my_seat["v"]:
-                    if attempt == 0:
-                        log(f"  [⏳] Bet waiting — seats={seat_disp(my_seat['v'])} "
-                            f"uid={my_uid['v']} (retry up to 4s)", Fore.YELLOW)
-                    await asyncio.sleep(0.5)
-                    continue
-                sent = []
                 if bet["sent_seats_gid"] != gid:
                     bet["sent_seats_gid"] = gid
                     bet["sent_seats"].clear()        # 新的一局 → 已发座位表清零
                     bet["rejected"].clear()          # 上一局被拒的座位不带过来
                     bet["rejected_gid"] = gid
+
+                # 已经有位拿到牌 = 本局开始发牌，下注窗口关了；还没发的位明确报出来
+                if str(bet["ok_gid"]) == str(gid):
+                    left = [s for s in list(my_seat["v"])
+                            if s not in bet["sent_seats"] and s not in bet["rejected"]]
+                    if left:
+                        log(f"  [⚠️] Dealing started before seat "
+                            f"{seat_disp(left)} could bet — skipped this round", Fore.YELLOW)
+                    return
+
+                if now > deadline:
+                    left = [s for s in list(my_seat["v"])
+                            if s not in bet["sent_seats"] and s not in bet["rejected"]]
+                    if left:
+                        log(f"  [❌] Bet timeout — seat {seat_disp(left)} never sent "
+                            f"(waited {deadline - t0:.0f}s)", Fore.RED)
+                    return
+
+                if my_uid["v"] is None or not my_seat["v"]:
+                    if not warned[0]:
+                        warned[0] = True
+                        log(f"  [⏳] Bet waiting — seats={seat_disp(my_seat['v'])} "
+                            f"uid={my_uid['v']}", Fore.YELLOW)
+                    await asyncio.sleep(0.1)
+                    continue
+
+                sent = []
                 for seat in list(my_seat["v"]):
                     if seat in bet["sent_seats"] or seat in bet["rejected"]:
                         continue                     # 这个位本局已经发过 / 已被拒，不再重发
+                    d = delay_of.setdefault(seat, random.uniform(BET_DELAY_MIN, BET_DELAY_MAX))
+                    if now - t0 < d:
+                        continue                     # 这个位自己的延时还没到
                     try:
                         await ws.send(_lpbet(ch_holder["ch"], gid, seat, amt, my_uid["v"]))
                     except Exception:
@@ -1694,9 +1720,9 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     bet["pending"][seat] = gid
                     bet["sent_seats"].add(seat)
                     sent.append(seat)
-                    log(f"  [💵] seat {seat_disp(seat)} bet {amt} sent (game {gid})", Fore.YELLOW)
-                    # 三个位不要挤在同一毫秒发出：拉开 0.2 秒，命令号也各自不同
-                    await asyncio.sleep(0.2)
+                    log(f"  [💵] seat {seat_disp(seat)} bet {amt} sent after {now - t0:.1f}s "
+                        f"(own delay {d:.1f}s, game {gid})", Fore.YELLOW)
+                    await asyncio.sleep(0.05)        # 连续两个位到点时留一点缝，命令号也不会撞
                 if sent:
                     bet["sent_gid"] = gid
                     bet["amount"] = amt
@@ -1705,7 +1731,7 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     log(f"  [💵] Main bet {amt} sent on {len(sent)} seat(s) "
                         f"{seat_disp(sent)} (game {gid}, uid {my_uid['v']}) — awaiting confirm",
                         Fore.YELLOW)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.05)
 
         def schedule_decision(ps: dict, seat: str):
             """轮到我：对本局这个座位上每个「正在活动且带 decisionOffer」的手，排一个延时动作"""
