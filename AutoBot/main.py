@@ -314,6 +314,13 @@ ACTION_DELAY_MAX = 5     # 轮到我后随机延时上限（秒）
 DECISION_WINDOW = 12     # 回合窗口保护：从收到 decisionOffer 起超过这个秒数就不再提交
 USE_CASHOUT = True       # 允许「提前兑现」参与自动决策（原样交 PP EV.py 按它的公式排；False = 不兑现）
 
+# ── 多座位：每局按「上一局结算完的 PDEV」决定坐几个位 ──
+#     PDEV > 0  → 最多坐 MAX_SEATS_PER_TABLE 个位（空位不足就坐几个算几个）
+#     PDEV <= 0 → 只坐 1 个位
+#     每个位各下同样金额的主注；1 表示关闭多座位（回到原来的单座位行为）
+MAX_SEATS_PER_TABLE = 3
+SIT_CONFIRM_TIMEOUT = 8  # sitdown 发出后多少秒还没收到 sit 确认就丢弃这次请求
+
 # ── 测试用：临时固定桌，跳过掷骰选桌（留空字符串 = 恢复正常掷骰选桌） ──
 # 目的：先验证下注提交格式是否被平台接受。桌名必须存在于 table_id.txt。
 FIXED_TABLE = ""
@@ -623,7 +630,12 @@ def update_pdev(cards):
 
 
 def seat_disp(s) -> str:
-    """座位号「显示用」换算：协议 0–6 → 显示 1–7。只影响屏幕输出，发给服务器的永远是 0–6。"""
+    """座位号「显示用」换算：协议 0–6 → 显示 1–7。只影响屏幕输出，发给服务器的永远是 0–6。
+    传入 list 时按多座位拼（如 "1+3+5"）。"""
+    if isinstance(s, (list, tuple, set)):
+        if not s:
+            return "—"
+        return "+".join(seat_disp(x) for x in sorted(s, key=lambda x: int(x)))
     try:
         n = int(s)
     except (TypeError, ValueError):
@@ -1426,16 +1438,22 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
     ch_holder = {"ch": name}  # 默认用桌名；subscribe 确认到达后改用服务器给的 channel
     occupied = {}             # 座位号(str) → 玩家名；非 sit 事件视为起身让位
     reported = {"init": False}
-    my_seat = {"v": None}     # 我们请求坐下的座位号
+    my_seat = {"v": []}       # 已确认坐下的座位号（list[str]，最多 MAX_SEATS_PER_TABLE 个）
+    my_pending = {}           # 已发 sitdown、等服务器 sit 确认的座位号 → 发出时间（秒）
+    leaving = set()           # 我们主动 unseat 的座位号（收到 stand 时不当作被踢）
     my_uid = {"v": None}      # 我们自己的 user_id（由坐下确认消息取得）
-    bet = {"pending": None, "last_gid": None, "task": None, "amount": None}
-    #                    待确认的 gameId / 本局已押 / 延时任务 / 本局主注额
+    bet = {"pending": {}, "last_gid": None, "task": None, "amount": None, "ok_gid": None}
+    #                    待确认 gid（座位→gid）/ 本局已押 / 延时任务 / 本局主注额 / 最近一次确认过的 gid
 
     dealer = {"cards": []}    # 庄家已知牌（h0，第一张即明牌），供 EV 使用
     acted = set()             # 已提交过的 decisionOffer.id（同一条 offer 只动作一次）
     dec_tasks = {}            # offer.id → 延时动作任务
     seen_dec = set()          # 已打印过的动作回执（去重）
     ins = {"done": None}      # 本局保险是否已回应（按 gameId 记）
+
+    def _mine(seat_no) -> bool:
+        """这个座位号是不是我们的（支持多座位）"""
+        return seat_no is not None and str(seat_no) in my_seat["v"]
 
     shoe = ShoeCounter()      # TC 自算（接管后不再用主程序推的 tc）
     taken = {"v": False}      # 是否已在 betsopen 接管
@@ -1473,7 +1491,7 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
         CARRY["table"] = name
         CARRY["cards"] = list(shoe.cards)
         CARRY["tc"] = shoe.tc
-        CARRY["seat"] = my_seat["v"]
+        CARRY["seat"] = my_seat["v"][0] if my_seat["v"] else None
         CARRY["ts"] = time.strftime("%H:%M:%S")
         render()
 
@@ -1502,28 +1520,97 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
             else:
                 seat = random.choice(empty)
             await ws.send(_sitdown(ch_holder["ch"], seat))
-            my_seat["v"] = seat
-            UI["my_seat"] = seat
+            my_pending[seat] = time.monotonic()
+            UI["my_seat"] = list(my_seat["v"])
             log(f"  [🪑] Sitting down at seat {seat_disp(seat)}", Fore.CYAN)
 
-        async def place_bet_later(gid):
-            """开局后随机延时 3-5 秒，再提交该局主注（金额 = 用户指定值，未指定才取该桌最低限额）"""
-            await asyncio.sleep(random.uniform(BET_DELAY_MIN, BET_DELAY_MAX))
-            if bet["last_gid"] != gid or my_seat["v"] is None or my_uid["v"] is None:
-                return
-            amt = bet_amount if bet_amount else (min_bet or FALLBACK_BET)
+        async def sit_seat(seat: str):
+            """发 sitdown 并登记为待确认（确认前不会往这个位下注）"""
+            await ws.send(_sitdown(ch_holder["ch"], seat))
+            my_pending[seat] = time.monotonic()
+            log(f"  [🪑] Sitting down at seat {seat_disp(seat)}", Fore.CYAN)
+
+        async def leave_seat(seat: str):
+            """按座位号单个退位（<unseat seatNum="N">）；立刻从座位表移除，避免再往这块下注"""
             try:
-                await ws.send(_lpbet(ch_holder["ch"], gid, my_seat["v"], amt, my_uid["v"]))
+                await ws.send(_unseat(ch_holder["ch"], seat))
             except Exception:
                 return
-            bet["pending"] = gid
-            bet["amount"] = amt
-            UI["action"] = f"Main bet {amt} sent — awaiting confirm…"
-            log(f"  [💵] Main bet {amt} sent (game {gid} seat {seat_disp(my_seat['v'])}) "
-                f"— awaiting confirm", Fore.YELLOW)
+            leaving.add(seat)
+            if seat in my_seat["v"]:
+                my_seat["v"].remove(seat)
+            bet["pending"].pop(seat, None)
+            UI["my_seat"] = list(my_seat["v"])
+            log(f"  [🚪] Left seat {seat_disp(seat)}", Fore.CYAN)
 
-        def schedule_decision(ps: dict):
-            """轮到我：对本局每个「正在活动且带 decisionOffer」的手，排一个延时动作"""
+        async def adjust_seats(tag: str):
+            """每局开始前按上一局结算完的 PDEV 调整座位数。
+            PDEV > 0 → 最多 MAX_SEATS_PER_TABLE 个位；PDEV <= 0 → 1 个位。
+            能坐几个算几个：空位不够就少坐，不等待、不抢位。"""
+            pdev = UI.get("pdev")
+            txt = f"{pdev:+.7f}" if isinstance(pdev, (int, float)) else "—"
+            target = MAX_SEATS_PER_TABLE if (isinstance(pdev, (int, float)) and pdev > 0) else 1
+            # 迟迟没确认的 sitdown 直接丢掉，否则会一直被当成「已经坐着」而不补位
+            now = time.monotonic()
+            for s in [s for s, t in my_pending.items() if now - t > SIT_CONFIRM_TIMEOUT]:
+                my_pending.pop(s, None)
+                log(f"  [⚠️] sitdown not confirmed on seat {seat_disp(s)} — dropping request",
+                    Fore.YELLOW)
+                try:
+                    await ws.send(_unseat(ch_holder["ch"], s))   # 可能其实坐上去了，顺手清掉
+                except Exception:
+                    pass
+            cur = list(my_seat["v"]) + [s for s in my_pending if s not in my_seat["v"]]
+            if len(cur) > target:
+                for s in cur[target:]:
+                    if s in my_seat["v"]:
+                        await leave_seat(s)
+                    else:
+                        my_pending.pop(s, None)
+                log(f"  [💺] {tag}: PDEV {txt} → target {target}, left {len(cur) - target} seat(s)",
+                    Fore.MAGENTA)
+                return
+            if len(cur) < target:
+                free = [str(n) for n in range(7)
+                        if str(n) not in occupied and str(n) not in my_seat["v"]
+                        and str(n) not in my_pending]
+                need = target - len(cur)
+                pick = random.sample(free, min(need, len(free)))
+                for s in pick:
+                    await sit_seat(s)
+                short = "" if len(pick) == need else f" (only {len(pick)} free, wanted {need})"
+                log(f"  [💺] {tag}: PDEV {txt} → target {target}, sitting {len(pick)} more seat(s){short}",
+                    Fore.MAGENTA)
+
+        async def place_bet_later(gid):
+            """开局后随机延时 3-5 秒，再对每个已确认的座位各发一次主注（金额 = 用户指定值）"""
+            await asyncio.sleep(random.uniform(BET_DELAY_MIN, BET_DELAY_MAX))
+            # 刚补坐的位 sit 确认可能还没回来 → 最多再等 1 秒，免得这个位这一局漏下注
+            if my_pending:
+                for _ in range(20):
+                    if not my_pending:
+                        break
+                    await asyncio.sleep(0.05)
+            if bet["last_gid"] != gid or not my_seat["v"] or my_uid["v"] is None:
+                return
+            amt = bet_amount if bet_amount else (min_bet or FALLBACK_BET)
+            sent = []
+            for seat in list(my_seat["v"]):
+                try:
+                    await ws.send(_lpbet(ch_holder["ch"], gid, seat, amt, my_uid["v"]))
+                except Exception:
+                    return
+                bet["pending"][seat] = gid
+                sent.append(seat)
+            if not sent:
+                return
+            bet["amount"] = amt
+            UI["action"] = f"Main bet {amt} × {len(sent)} seat(s) — awaiting confirm…"
+            log(f"  [💵] Main bet {amt} sent on {len(sent)} seat(s) "
+                f"{seat_disp(sent)} (game {gid}) — awaiting confirm", Fore.YELLOW)
+
+        def schedule_decision(ps: dict, seat: str):
+            """轮到我：对本局这个座位上每个「正在活动且带 decisionOffer」的手，排一个延时动作"""
             gid = str(ps.get("gameId") or "")
             if not gid or my_uid["v"] is None:
                 return
@@ -1541,14 +1628,15 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                 if not oid or oid in acted:
                     continue          # 同一条 offer（含重播）只动作一次
                 acted.add(oid)
-                dec_tasks[oid] = asyncio.create_task(act_later(gid, hkey[1:], hand, offer))
+                dec_tasks[oid] = asyncio.create_task(
+                    act_later(gid, seat, hkey[1:], hand, offer))
 
-        async def act_later(gid, hand_idx, hand, offer):
+        async def act_later(gid, seat, hand_idx, hand, offer):
             """轮到我 → 延时 3-5 秒 → EV 程序算最优动作 → 提交"""
             t0 = time.monotonic()
             delay = random.uniform(ACTION_DELAY_MIN, ACTION_DELAY_MAX)
             await asyncio.sleep(delay)
-            if my_seat["v"] is None or my_uid["v"] is None:
+            if not _mine(seat) or my_uid["v"] is None:
                 return
             if time.monotonic() - t0 > DECISION_WINDOW:
                 log(f"  [⚠️] Decision window passed (>{DECISION_WINDOW}s) — skipping hand {hand_idx}",
@@ -1565,14 +1653,13 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                 return
 
             try:
-                await ws.send(_decision(ch_holder["ch"], gid, my_uid["v"],
-                                        my_seat["v"], hand_idx, dec))
+                await ws.send(_decision(ch_holder["ch"], gid, my_uid["v"], seat, hand_idx, dec))
             except Exception:
                 return
             evtxt = " | ".join(f'{x["decision"]} {x["ev"]:+.4f}' for x in ordered)
             UI["ev"] = evtxt
-            UI["action"] = f"{dec} sent (delay {delay:.1f}s)"
-            log(f"  [▶️] Action {dec} sent (game {gid} seat {seat_disp(my_seat['v'])} "
+            UI["action"] = f"{dec} sent (seat {seat_disp(seat)}, delay {delay:.1f}s)"
+            log(f"  [▶️] Action {dec} sent (game {gid} seat {seat_disp(seat)} "
                 f"hand {hand_disp(hand_idx)}) delay {delay:.1f}s", Fore.CYAN)
 
         async def send_insurance(gid):
@@ -1580,13 +1667,17 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
             ev = (calc_ev(list(shoe.cards), ["A"], []) or {}).get("insurance_ev")
             buy = isinstance(ev, (int, float)) and ev > 0
             amt = bet_amount if bet_amount else max(1, int(round((bet["amount"] or min_bet or FALLBACK_BET) / 2)))
-            try:
-                await ws.send(_insurance(ch_holder["ch"], gid, my_uid["v"],
-                                         my_seat["v"], buy, amt))
-            except Exception:
+            # 只对本局真正下过注的座位回执（补座的位没下注就不买，免得被拒）
+            seats = [s for s, g in bet["pending"].items() if str(g) == str(gid)] or list(my_seat["v"])
+            if not seats:
                 return
-            log(f"  [🛡️] Insurance {'BUY' if buy else 'DECLINE'} "
-                f"(EV {ev:+.4f}, amount {amt}) — replied",
+            for seat in seats:
+                try:
+                    await ws.send(_insurance(ch_holder["ch"], gid, my_uid["v"], seat, buy, amt))
+                except Exception:
+                    return
+            log(f"  [🛡️] Insurance {'BUY' if buy else 'DECLINE'} × {len(seats)} seat(s) "
+                f"(EV {ev:+.4f}, amount {amt} each) — replied",
                 Fore.GREEN if buy else Fore.YELLOW)
 
         init_task = asyncio.create_task(initial_report())
@@ -1604,7 +1695,7 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                 if "placebetError" in d or "betValidationError" in d:
                     key = "placebetError" if "placebetError" in d else "betValidationError"
                     e = d.get(key) or {}
-                    if my_seat["v"] is not None and str(e.get("seat")) == str(my_seat["v"]):
+                    if _mine(e.get("seat")):
                         BLACKLIST.add(name)
                         log(f"  [⛔] Bet rejected ({key} {e.get('code')}: {e.get('desc', '')}) "
                             f"— blacklisting table, re-rolling", Fore.RED)
@@ -1613,9 +1704,12 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
 
                 # ── 本局结束仍无我们座位的牌 → 判定被拒（兜底） ──
                 if "bjGameEnd" in d:
-                    if bet["pending"] and str((d.get("bjGameEnd") or {}).get("id")) == str(bet["pending"]):
+                    endg = str((d.get("bjGameEnd") or {}).get("id"))
+                    pg = {str(v) for v in bet["pending"].values()}
+                    # 一注都没确认过（ok_gid 也不是这一局）才算整桌被拒；部分确认只提示
+                    if endg in pg and str(bet["ok_gid"]) not in pg:
                         BLACKLIST.add(name)
-                        log(f"  [⛔] Round ended (game {bet['pending']}) with no cards on our seat "
+                        log(f"  [⛔] Round ended (game {endg}) with no cards on our seat(s) "
                             f"— blacklisting table, re-rolling", Fore.RED)
                         return "round ended with no bet confirmation"
                     continue
@@ -1640,11 +1734,13 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     UI["events"].clear()
                     render()
                     # 上一局提交的下注至今无任何确认 → 判定被平台静默拒绝
-                    if bet["pending"] and gid and gid != bet["pending"]:
+                    pg = {str(v) for v in bet["pending"].values()}
+                    if bet["pending"] and gid and gid not in pg and str(bet["ok_gid"]) not in pg:
                         BLACKLIST.add(name)
-                        log(f"  [⛔] Previous bet (game {bet['pending']}) never confirmed — "
+                        log(f"  [⛔] Previous bet (game {sorted(pg)}) never confirmed — "
                             f"treated as rejected, blacklisting table", Fore.RED)
                         return "previous bet not confirmed"
+                    bet["pending"].clear()     # 上一局的待确认表不带到本局
                     if not taken["v"]:
                         snap = None
                         if carry_in and carry_in.get("cards") is not None:
@@ -1696,6 +1792,10 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     voip["detected"] = False
                     voip["after"] = False
                     voip["pending"] = False
+                    # ── 每局按「上一局结算完的 PDEV」调整座位数（只在进入新的一局时做）──
+                    #    正 → 最多 MAX_SEATS_PER_TABLE 个位；非正 → 1 个位（能坐几个算几个）
+                    if gid and gid != bet["last_gid"]:
+                        await adjust_seats(f"game {gid}")
                     # 已坐下且本局未押过 → 随机延时 3-5 秒押主注（只押主注）
                     if gid and my_uid["v"] is not None and gid != bet["last_gid"]:
                         bet["last_gid"] = gid
@@ -1716,7 +1816,7 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     gid = bet["last_gid"]
                     log(f"  [🛡️] Insurance offer (seat {seat_disp(ni.get('seat'))} "
                         f"auto={ni.get('auto')}) game {gid}", Fore.CYAN)
-                    if (gid and my_uid["v"] is not None and my_seat["v"] is not None
+                    if (gid and my_uid["v"] is not None and my_seat["v"]
                             and bet["amount"] and ins["done"] != gid):
                         ins["done"] = gid
                         await send_insurance(gid)
@@ -1747,16 +1847,16 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                         added = shoe.feed_player_seat(ps)
                         if added:
                             report_tc(added)
-                    # 下注确认：本局我们座位真实拿到牌
-                    if (bet["pending"] and str(ps.get("gameId")) == str(bet["pending"])
-                            and my_seat["v"] is not None
-                            and str(seat_no) == str(my_seat["v"])):
-                        log(f"  [✅] Bet confirmed (game {bet['pending']} "
-                            f"seat {seat_disp(my_seat['v'])} got cards)", Fore.GREEN)
-                        bet["pending"] = None
+                    # 下注确认：本局我们某个座位真实拿到牌
+                    cgid = str(ps.get("gameId"))
+                    if _mine(seat_no) and bet["pending"].get(str(seat_no)) == cgid:
+                        bet["pending"].pop(str(seat_no), None)
+                        bet["ok_gid"] = cgid
+                        log(f"  [✅] Bet confirmed (game {cgid} "
+                            f"seat {seat_disp(seat_no)} got cards)", Fore.GREEN)
                     # 我们座位：轮到我 → 排动作；并打印动作回执（服务器确认我们这手做了什么）
-                    if my_seat["v"] is not None and str(seat_no) == str(my_seat["v"]):
-                        schedule_decision(ps)
+                    if _mine(seat_no):
+                        schedule_decision(ps, str(seat_no))
                         for hkey in sorted(k for k in ps if k.startswith("h") and len(k) == 2):
                             hh = ps.get(hkey)
                             if not isinstance(hh, dict):
@@ -1764,7 +1864,9 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                             cs = _hand_cards(hh)
                             slot = int(hkey[1:]) if hkey[1:].isdigit() else -1   # 协议手号 0/1 → 板面 hand1 / hand2
                             if cs and 0 <= slot < len(UI["me_hands"]):
-                                UI["me_hands"][slot] = f"{hh.get('score', '?')} ( {' '.join(cs)} )"
+                                # 多座位时前面标上座位号，否则看不出这一手是哪个位的
+                                tag = f"S{seat_disp(seat_no)} " if len(my_seat["v"]) > 1 else ""
+                                UI["me_hands"][slot] = f"{tag}{hh.get('score', '?')} ( {' '.join(cs)} )"
                             cd = hh.get("currentDecision")
                             if (hh.get("currentDecisionAction") in ("playerDecision", "systemCall")
                                     and cd):
@@ -1787,17 +1889,29 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     if ev == "sit":
                         occupied[num] = s.get("screen_name", "")
                         UI["occupy"][num] = s.get("screen_name", "")
-                        # 我们坐下的那个位子 → 记下自己的 user_id
-                        if my_uid["v"] is None and num == my_seat["v"]:
-                            my_uid["v"] = s.get("user_id")
+                        # 我们自己请求坐下的位子（一次可能多个）→ 转入已确认座位表
+                        if num in my_pending:
+                            my_pending.pop(num, None)
+                            if num not in my_seat["v"]:
+                                my_seat["v"].append(num)
+                            if my_uid["v"] is None:
+                                my_uid["v"] = s.get("user_id")
+                            UI["my_seat"] = list(my_seat["v"])
                             log(f"  [✅] Seat confirmed: {seat_disp(num)} "
-                                f"(user_id={my_uid['v']})", Fore.GREEN)
+                                f"(user_id={my_uid['v']}) — {len(my_seat['v'])} seat(s) now", Fore.GREEN)
                     elif ev == "stand":
                         occupied.pop(num, None)
                         UI["occupy"].pop(num, None)
                         UI["scores"].pop(num, None)
+                        if num in leaving:
+                            leaving.discard(num)     # 我们自己退的，不算被踢
+                            continue
+                        if num in my_seat["v"]:
+                            my_seat["v"].remove(num)
+                            UI["my_seat"] = list(my_seat["v"])
                         # 我们因久坐未下注被服务器请出 → 断开，回去重新掷骰选桌（不拉黑）
-                        if s.get("type") == "timeout" and s.get("user_id") == my_uid["v"]:
+                        if (s.get("type") == "timeout" and my_uid["v"]
+                                and s.get("user_id") == my_uid["v"]):
                             log("  [⛔] Kicked from seat by server (stand/timeout)",
                                 Fore.RED)
                             return "kicked from seat by server (stand/timeout)"
@@ -1835,6 +1949,14 @@ def _ping(channel: str) -> str:
 def _sitdown(channel: str, seat: str) -> str:
     return (f'<command channel="{channel}">'
             f'<sitdown gameMode="blackjack_desktop" seatNum="{seat}"></sitdown>'
+            f'</command>')
+
+
+def _unseat(channel: str, seat: str) -> str:
+    """离开座位（按座位号单个退）—— 格式取自实测帧：
+    <command channel="table-xxx"><unseat seatNum="6"></unseat></command>"""
+    return (f'<command channel="{channel}">'
+            f'<unseat seatNum="{seat}"></unseat>'
             f'</command>')
 
 
