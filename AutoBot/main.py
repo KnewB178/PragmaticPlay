@@ -1658,13 +1658,18 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     Fore.MAGENTA)
 
         async def place_bet_later(gid):
-            """每个座位各自随机延时 3-5 秒再下注 —— 当成三个互不相干的玩家。
-            座椅 A / B / C 各自有自己的一次随机延时，谁先到点谁先发，互不等待。
-            座位晚确认也能补上：确认那一刻只要它自己的延时已过，立刻发。
+            """开局后随机 3-5 秒，用【一条 lpbet】把我方所有座位一次押出去。
+
+            ★ 为什么不是每个座位各发一条：
+              一个账号在一局里只有一个「注位」，再发一条 lpbet 会被服务器当成
+              「改注」——把刚才那一注挪到新座位上，桌上最终只剩最后一注。
+              这就是「坐 3 个位只下 1 注」的根因。PP 官方玩法本身也是
+              一次下注、注额自动复制到这个玩家的所有座位。
+            座位晚确认也能补上：只要还没发出去，确认后进同一批一起押。
             """
             amt = bet_amount if bet_amount else (min_bet or FALLBACK_BET)
             t0 = time.monotonic()
-            delay_of = {}                       # 座位 → 这个位自己的随机延时（秒）
+            delay = random.uniform(BET_DELAY_MIN, BET_DELAY_MAX)   # 整批一次随机延时
             deadline = t0 + BET_DELAY_MAX + 4   # 最晚等到「最长延时 + 4 秒」
             warned = [False]
 
@@ -1706,33 +1711,40 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     await asyncio.sleep(0.1)
                     continue
 
-                sent = []
-                for seat in list(my_seat["v"]):
-                    if seat in bet["sent_seats"] or seat in bet["rejected"]:
-                        continue                     # 这个位本局已经发过 / 已被拒，不再重发
-                    d = delay_of.setdefault(seat, random.uniform(BET_DELAY_MIN, BET_DELAY_MAX))
-                    if now - t0 < d:
-                        continue                     # 这个位自己的延时还没到
-                    try:
-                        await ws.send(_lpbet(ch_holder["ch"], gid, seat, amt, my_uid["v"]))
-                    except Exception:
-                        return
-                    bet["pending"][seat] = gid
-                    bet["sent_seats"].add(seat)
-                    sent.append(seat)
-                    log(f"  [💵] seat {seat_disp(seat)} bet {amt} sent after {now - t0:.1f}s "
-                        f"(own delay {d:.1f}s, game {gid})", Fore.YELLOW)
-                    await asyncio.sleep(0.05)        # 连续两个位到点时留一点缝，命令号也不会撞
-                if sent:
-                    bet["sent_gid"] = gid
-                    bet["amount"] = amt
-                    UI["action"] = (f"Main bet {amt} × {len(bet['sent_seats'])} seat(s) "
-                                    f"— awaiting confirm…")
-                    log(f"  [💵] Main bet {amt} sent — now {len(bet['sent_seats'])}/ "
-                        f"{len(my_seat['v'])} seat(s) {seat_disp(sorted(bet['sent_seats']))} "
-                        f"(game {gid}, uid {my_uid['v']}) — awaiting confirm",
-                        Fore.YELLOW)
-                await asyncio.sleep(0.05)
+                if now - t0 < delay:            # 整批的随机延时还没到
+                    await asyncio.sleep(0.05)
+                    continue
+
+                # 刚发出去的 sitdown 还在等服务器确认 → 等它确认了再一起押（最多再等 1.5 秒），
+                # 否则这一注就只带了已有的座位，新坐下的那个位要等下一局
+                if my_pending and now - t0 < delay + 1.5:
+                    await asyncio.sleep(0.05)
+                    continue
+
+                seats = [s for s in list(my_seat["v"])
+                         if s not in bet["sent_seats"] and s not in bet["rejected"]]
+                if not seats:                   # 都发过了 → 本局收工
+                    return
+
+                try:
+                    if len(seats) == 1:
+                        await ws.send(_lpbet(ch_holder["ch"], gid, seats[0], amt, my_uid["v"]))
+                    else:
+                        await ws.send(_lpbet_multi(ch_holder["ch"], gid, seats, amt,
+                                                   my_uid["v"]))
+                except Exception:
+                    return
+                for s in seats:
+                    bet["pending"][s] = gid
+                    bet["sent_seats"].add(s)
+                bet["sent_gid"] = gid
+                bet["amount"] = amt
+                UI["action"] = (f"Main bet {amt} × {len(seats)} seat(s) "
+                                f"— awaiting confirm…")
+                log(f"  [💵] Main bet {amt} sent at {now - t0:.1f}s on {len(seats)} "
+                    f"seat(s) {seat_disp(seats)} in one command "
+                    f"(game {gid}, uid {my_uid['v']}) — awaiting confirm", Fore.YELLOW)
+                return
 
         def schedule_decision(ps: dict, seat: str):
             """轮到我：对本局这个座位上每个「正在活动且带 decisionOffer」的手，排一个延时动作"""
@@ -1862,12 +1874,14 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                             f"last_gid={bet['last_gid']})", Fore.RED)
                     # 诊断：发了几个位、实际几个位拿到牌 —— 多座位下注是否真的成功，看这一行
                     if bet["sent_gid"] == endg or bet["carded"]:
+                        miss = [s for s in my_seat["v"] if s not in bet["sent_seats"]]
                         log(f"  [📊] Game {endg}: bet sent on "
                             f"{len(bet['sent_seats'])} seat(s) {seat_disp(sorted(bet['sent_seats']))}"
                             f" → cards on {len(bet['carded'])} seat(s) "
-                            f"{seat_disp(sorted(bet['carded']))}",
-                            Fore.GREEN if len(bet["carded"]) == len(bet["sent_seats"])
-                            else Fore.YELLOW)
+                            f"{seat_disp(sorted(bet['carded']))}"
+                            + (f" | no bet: {seat_disp(miss)}" if miss else ""),
+                            Fore.GREEN if (len(bet["carded"]) == len(bet["sent_seats"])
+                                           and not miss) else Fore.YELLOW)
                     pg = {str(v) for v in bet["pending"].values()}
                     # 一注都没确认过（ok_gid 也不是这一局）才算整桌被拒；部分确认只提示
                     if endg in pg and str(bet["ok_gid"]) not in pg:
@@ -2187,6 +2201,19 @@ def _lpbet(channel: str, gid, seat, amount: int, user_id: str) -> str:
             f'<bet seat="{seat}" amount="{amount}" mainbet="true" bj21plus3="false" '
             f'perfectpair="false" betbehind="false" ck="{ck}"/>'
             f'</lpbet></command>')
+
+
+def _lpbet_multi(channel: str, gid, seats, amount: int, user_id: str) -> str:
+    """一个账号同一局押多个座位 —— 必须放在【同一条 lpbet】里。
+    分开发多条 lpbet 会被服务器当成「改注」，只保留最后一条。"""
+    ck = _ck()
+    inner = "".join(
+        f'<bet seat="{s}" amount="{amount}" mainbet="true" bj21plus3="false" '
+        f'perfectpair="false" betbehind="false" ck="{_ck()}"/>'
+        for s in seats)
+    return (f'<command channel="{channel}">'
+            f'<lpbet gameMode="blackjack_desktop" gameId="{gid}" userId="{user_id}" ck="{ck}">'
+            f'{inner}</lpbet></command>')
 
 
 # EV 动作名 → 协议 dec 值（注意 cashOut 是驼峰，其余全小写）

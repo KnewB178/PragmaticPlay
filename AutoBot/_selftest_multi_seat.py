@@ -48,8 +48,13 @@ def unseats(ws):
 
 
 def bets(ws):
-    return [int(m.group(1)) for s in ws.sent
-            for m in [re.search(r'<bet seat="(\d+)"', s)] if m]
+    """所有 <bet seat="N">（一条 lpbet 里可能带多个座位）"""
+    return [int(n) for s in ws.sent for n in re.findall(r'<bet seat="(\d+)"', s)]
+
+
+def lpbet_cmds(ws):
+    """所有 lpbet 命令（一个账号一局只能有一条，多条会被服务器当成改注）"""
+    return [s for s in ws.sent if "<lpbet" in s]
 
 
 def decisions(ws):
@@ -267,6 +272,10 @@ async def run_bet_ack_trap():
     print("⑩ 无牌回执干扰下，3 个位应各下 1 注:", got)
     assert len(got) == 3, f"3 个位应各下 1 注，实际 {got}"
     assert sorted(got) == sorted(seats), f"座位应各一条，实际 {got} / 坐的是 {seats}"
+    cmd = lpbet_cmds(ws)
+    print("⑪ 本局 lpbet 命令数（必须 1 条，多座位要放在同一条里）:", len(cmd))
+    assert len(cmd) == 1, f"3 个座位应只发 1 条 lpbet（多条会被当改注），实际 {len(cmd)} 条"
+    assert cmd[0].count("<bet ") == 3, f"这条 lpbet 里应带 3 个 <bet>，实际 {cmd[0]}"
 
     ws.stop()
     await asyncio.wait_for(task, timeout=5)
