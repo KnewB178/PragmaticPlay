@@ -1508,7 +1508,8 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
     leaving = set()           # 我们主动 unseat 的座位号（收到 stand 时不当作被踢）
     my_uid = {"v": None}      # 我们自己的 user_id（由坐下确认消息取得）
     bet = {"pending": {}, "last_gid": None, "task": None, "amount": None, "ok_gid": None,
-           "sent_gid": None, "sent_seats": set(), "sent_seats_gid": None}
+           "sent_gid": None, "sent_seats": set(), "sent_seats_gid": None,
+           "rejected": set(), "rejected_gid": None, "carded": set()}
     #   待确认 gid（座位→gid）/ 本局基准 gid / 延时任务 / 本局主注额 / 最近确认过的 gid
     #   / 真正发出过注的 gid / 本局已发过注的座位 / 那份座位表属于哪一局
 
@@ -1681,9 +1682,11 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                 if bet["sent_seats_gid"] != gid:
                     bet["sent_seats_gid"] = gid
                     bet["sent_seats"].clear()        # 新的一局 → 已发座位表清零
+                    bet["rejected"].clear()          # 上一局被拒的座位不带过来
+                    bet["rejected_gid"] = gid
                 for seat in list(my_seat["v"]):
-                    if seat in bet["sent_seats"]:
-                        continue                     # 这个位本局已经发过了（确认后也不会重发）
+                    if seat in bet["sent_seats"] or seat in bet["rejected"]:
+                        continue                     # 这个位本局已经发过 / 已被拒，不再重发
                     try:
                         await ws.send(_lpbet(ch_holder["ch"], gid, seat, amt, my_uid["v"]))
                     except Exception:
@@ -1691,6 +1694,9 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     bet["pending"][seat] = gid
                     bet["sent_seats"].add(seat)
                     sent.append(seat)
+                    log(f"  [💵] seat {seat_disp(seat)} bet {amt} sent (game {gid})", Fore.YELLOW)
+                    # 三个位不要挤在同一毫秒发出：拉开 0.2 秒，命令号也各自不同
+                    await asyncio.sleep(0.2)
                 if sent:
                     bet["sent_gid"] = gid
                     bet["amount"] = amt
@@ -1794,11 +1800,25 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                 if not isinstance(d, dict):
                     continue
 
-                # ── 下注被拒：平台回执带 seat，是我们座位 → 拉黑该桌、断开重掷 ──
+                # ── 下注被拒：平台回执带 seat（多座位时只有全被拒才拉黑整桌）──
                 if "placebetError" in d or "betValidationError" in d:
                     key = "placebetError" if "placebetError" in d else "betValidationError"
                     e = d.get(key) or {}
                     if _mine(e.get("seat")):
+                        s = str(e.get("seat"))
+                        # 多座位：这个位被拒 → 记下来不再重发，但不因为一个位被拒就整桌拉黑
+                        if bet["rejected_gid"] != bet["last_gid"]:
+                            bet["rejected_gid"] = bet["last_gid"]
+                            bet["rejected"].clear()
+                        bet["rejected"].add(s)
+                        bet["sent_seats"].discard(s)
+                        bet["pending"].pop(s, None)
+                        rest = [x for x in list(bet["sent_seats"]) if x != s]
+                        if rest or (bet["ok_gid"] and str(bet["ok_gid"]) == str(bet["last_gid"])):
+                            log(f"  [⚠️] Bet rejected on seat {seat_disp(s)} "
+                                f"({key} {e.get('code')}: {e.get('desc', '')}) — "
+                                f"other seat(s) {seat_disp(rest)} keep playing", Fore.YELLOW)
+                            continue
                         BLACKLIST.add(name)
                         log(f"  [⛔] Bet rejected ({key} {e.get('code')}: {e.get('desc', '')}) "
                             f"— blacklisting table, re-rolling", Fore.RED)
@@ -1813,6 +1833,14 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                         log(f"  [❌] Game {endg} ended with NO bet sent "
                             f"(seats={seat_disp(my_seat['v'])} uid={my_uid['v']} "
                             f"last_gid={bet['last_gid']})", Fore.RED)
+                    # 诊断：发了几个位、实际几个位拿到牌 —— 多座位下注是否真的成功，看这一行
+                    if bet["sent_gid"] == endg or bet["carded"]:
+                        log(f"  [📊] Game {endg}: bet sent on "
+                            f"{len(bet['sent_seats'])} seat(s) {seat_disp(sorted(bet['sent_seats']))}"
+                            f" → cards on {len(bet['carded'])} seat(s) "
+                            f"{seat_disp(sorted(bet['carded']))}",
+                            Fore.GREEN if len(bet["carded"]) == len(bet["sent_seats"])
+                            else Fore.YELLOW)
                     pg = {str(v) for v in bet["pending"].values()}
                     # 一注都没确认过（ok_gid 也不是这一局）才算整桌被拒；部分确认只提示
                     if endg in pg and str(bet["ok_gid"]) not in pg:
@@ -1820,6 +1848,7 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                         log(f"  [⛔] Round ended (game {endg}) with no cards on our seat(s) "
                             f"— blacklisting table, re-rolling", Fore.RED)
                         return "round ended with no bet confirmation"
+                    bet["carded"].clear()
                     continue
 
                 # ── 开局公告 → 接管点 / 新局 / 换鞋 + 押主注 ──
@@ -1967,6 +1996,7 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     if _mine(seat_no) and bet["pending"].get(str(seat_no)) == cgid:
                         bet["pending"].pop(str(seat_no), None)
                         bet["ok_gid"] = cgid
+                        bet["carded"].add(str(seat_no))
                         log(f"  [✅] Bet confirmed (game {cgid} "
                             f"seat {seat_disp(seat_no)} got cards)", Fore.GREEN)
                     # 我们座位：轮到我 → 排动作；并打印动作回执（服务器确认我们这手做了什么）
@@ -2102,9 +2132,23 @@ def _unseat(channel: str, seat: str) -> str:
             f'</command>')
 
 
+_CK = {"last": 0}
+
+
+def _ck() -> str:
+    """客户端命令号：毫秒时间戳，但保证严格单调递增。
+    三个座位几乎同时下注时，若共用同一个毫秒值，服务器可能当成重复命令丢掉 →
+    后两个位就一注都没有。这里同一毫秒内重复调用自动 +1。"""
+    ms = int(time.time() * 1000)
+    if ms <= _CK["last"]:
+        ms = _CK["last"] + 1
+    _CK["last"] = ms
+    return str(ms)
+
+
 def _lpbet(channel: str, gid, seat, amount: int, user_id: str) -> str:
     """下注主注（只押主注，其余玩法一律 false）—— 格式取自实测抓包 bet_test_log.txt"""
-    ck = str(int(time.time() * 1000))
+    ck = _ck()
     return (f'<command channel="{channel}">'
             f'<lpbet gameMode="blackjack_desktop" gameId="{gid}" userId="{user_id}" ck="{ck}">'
             f'<bet seat="{seat}" amount="{amount}" mainbet="true" bj21plus3="false" '
@@ -2143,7 +2187,7 @@ def choose_action(all_cards, dealer_cards, player_cards, offer, bet_amount):
 
 def _decision(channel: str, gid, user_id: str, seat, hand, dec: str) -> str:
     """提交动作 —— 格式取自实测抓包：<decision ... seatNum hand dec>（不需要 decisionOffer.id）"""
-    ck = str(int(time.time() * 1000))
+    ck = _ck()
     return (f'<command channel="{channel}">'
             f'<decision gameMode="blackjack_desktop" gameId="{gid}" userId="{user_id}" '
             f'ck="{ck}" seatNum="{seat}" hand="{hand}" dec="{dec}"></decision>'
@@ -2152,7 +2196,7 @@ def _decision(channel: str, gid, user_id: str, seat, hand, dec: str) -> str:
 
 def _insurance(channel: str, gid, user_id: str, seat, buy: bool, amount: int) -> str:
     """保险回执：choice=y 买 / n 不买，amount 为保额 —— 格式取自实测抓包"""
-    ck = str(int(time.time() * 1000))
+    ck = _ck()
     return (f'<command channel="{channel}">'
             f'<insurance gameMode="blackjack_desktop" gameId="{gid}" userId="{user_id}" '
             f'ck="{ck}" >'
