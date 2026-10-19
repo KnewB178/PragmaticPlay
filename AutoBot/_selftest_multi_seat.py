@@ -219,6 +219,60 @@ async def run_multi_decision():
     print("\n✅ 全部通过")
 
 
+async def run_bet_ack_trap():
+    """复现现场：下注后服务器先推一条「只有注额、还没牌」的座位状态。
+    旧逻辑把它当成「已经拿到牌」→ ok_gid 立即成立 → 其余座位还没到自己的
+    随机延时就被判「已发牌，下注窗口关了」跳过 → 三个位只下了一注。
+    正确行为：必须真的拿到牌才算确认，三个位各自到点各下一注。"""
+    ws = FakeWS()
+    main.websockets.connect = lambda *a, **k: _Conn(ws)
+    main.SEAT_MODE["v"] = main.SEAT_MODE_PDEV
+    main.BET_DELAY_MIN, main.BET_DELAY_MAX = 0.6, 2.0      # 拉开间距，模拟三个独立玩家
+    main.UI["active"] = False
+    main.UI["pdev"] = 0.02
+    main.update_pdev = lambda cards: main.UI.update({"pdev": 0.02, "pdev_issued": "test"})
+    carry = {"cards": ["2"] * 40, "tc": 2.0, "seat": None}
+
+    task = asyncio.create_task(main.listen_table("TEST4", "wss://x/y", 10, 10, carry))
+    ws.push({"subscribe": {"channel": "table-test4"}})
+    await asyncio.sleep(3.4)
+    first = sitdowns(ws)[0]
+    ws.push({"seat": {"num": first, "event": "sit", "user_id": "U1", "screen_name": "me"}})
+    await asyncio.sleep(0.2)
+    ws.push({"betsopen": {"game": "a1"}})
+    await asyncio.sleep(0.8)
+    seats = sitdowns(ws)
+    for s in seats:
+        ws.push({"seat": {"num": s, "event": "sit", "user_id": "U1", "screen_name": "me"}})
+    await asyncio.sleep(0.3)
+    assert len(seats) == 3, f"应坐 3 个位，实际 {seats}"
+
+    seen = [0]
+
+    async def trap():
+        """每发出一注，立刻回一条没有牌的状态帧（注额回执）"""
+        while True:
+            got = bets(ws)
+            while seen[0] < len(got):
+                s = got[seen[0]]
+                seen[0] += 1
+                ws.push({"playerSeat": {"seatNumber": s, "gameId": "a1",
+                                        "h0": {"bet": 10}}})
+            await asyncio.sleep(0.01)
+
+    trap_task = asyncio.create_task(trap())
+    await asyncio.sleep(3.5)
+    trap_task.cancel()
+    got = bets(ws)
+    print("⑩ 无牌回执干扰下，3 个位应各下 1 注:", got)
+    assert len(got) == 3, f"3 个位应各下 1 注，实际 {got}"
+    assert sorted(got) == sorted(seats), f"座位应各一条，实际 {got} / 坐的是 {seats}"
+
+    ws.stop()
+    await asyncio.wait_for(task, timeout=5)
+    print("\n✅ 全部通过")
+
+
 class _Conn:
     def __init__(self, ws):
         self.ws = ws
@@ -235,6 +289,7 @@ if __name__ == "__main__":
         asyncio.run(run())
         asyncio.run(run_fixed())
         asyncio.run(run_multi_decision())
+        asyncio.run(run_bet_ack_trap())
     except AssertionError as e:
         print("\n❌", e)
         sys.exit(1)

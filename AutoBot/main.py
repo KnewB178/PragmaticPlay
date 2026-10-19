@@ -1728,8 +1728,9 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     bet["amount"] = amt
                     UI["action"] = (f"Main bet {amt} × {len(bet['sent_seats'])} seat(s) "
                                     f"— awaiting confirm…")
-                    log(f"  [💵] Main bet {amt} sent on {len(sent)} seat(s) "
-                        f"{seat_disp(sent)} (game {gid}, uid {my_uid['v']}) — awaiting confirm",
+                    log(f"  [💵] Main bet {amt} sent — now {len(bet['sent_seats'])}/ "
+                        f"{len(my_seat['v'])} seat(s) {seat_disp(sorted(bet['sent_seats']))} "
+                        f"(game {gid}, uid {my_uid['v']}) — awaiting confirm",
                         Fore.YELLOW)
                 await asyncio.sleep(0.05)
 
@@ -2017,9 +2018,15 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                         added = shoe.feed_player_seat(ps)
                         if added:
                             report_tc(added)
-                    # 下注确认：本局我们某个座位真实拿到牌
+                    # 下注确认：必须「我们这个座位本局真的拿到牌」才算数。
+                    # ★ 不能只看有没有 playerSeat 帧：下注后服务器会先推一条只有注额、没有牌的
+                    #   座位状态，旧逻辑拿它当「已发牌」→ 立刻判下注窗口关闭，其余座位还没到
+                    #   自己的随机延时就被跳过 —— 现场「坐 3 个位只下 1 注」就是这里造成的。
                     cgid = str(ps.get("gameId"))
-                    if _mine(seat_no) and bet["pending"].get(str(seat_no)) == cgid:
+                    got_cards = any(_hand_cards(v) for k, v in ps.items()
+                                    if k.startswith("h") and len(k) == 2 and isinstance(v, dict))
+                    if (got_cards and _mine(seat_no)
+                            and bet["pending"].get(str(seat_no)) == cgid):
                         bet["pending"].pop(str(seat_no), None)
                         bet["ok_gid"] = cgid
                         bet["carded"].add(str(seat_no))
