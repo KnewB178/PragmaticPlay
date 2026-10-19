@@ -321,6 +321,15 @@ USE_CASHOUT = True       # 允许「提前兑现」参与自动决策（原样�
 MAX_SEATS_PER_TABLE = 3
 SIT_CONFIRM_TIMEOUT = 8  # sitdown 发出后多少秒还没收到 sit 确认就丢弃这次请求
 
+# ── 座位模式（启动时在「粘贴 URL」后面问一次，记进 last_inputs.json）──
+#     1 = 永久 1 个位：不管 PDEV 正负，永远只打一个位（回到原来的单座行为）
+#     2 = 跟 PDEV    ：PDEV > 0 最多 MAX_SEATS_PER_TABLE 个位；<= 0 只坐 1 个位
+SEAT_MODE_FIXED = 1
+SEAT_MODE_PDEV = 2
+SEAT_MODES = {1: "fixed 1 seat", 2: "follow PDEV"}
+SEAT_MODE_DEFAULT = SEAT_MODE_PDEV
+SEAT_MODE = {"v": SEAT_MODE_DEFAULT}   # 运行时由 ask_seat_mode() 覆盖（值 1 / 2）
+
 # ── 测试用：临时固定桌，跳过掷骰选桌（留空字符串 = 恢复正常掷骰选桌） ──
 # 目的：先验证下注提交格式是否被平台接受。桌名必须存在于 table_id.txt。
 FIXED_TABLE = ""
@@ -541,6 +550,7 @@ UI = {
     "table": "—", "min_bet": None, "my_seat": None,
     "feed": "connecting…" if USE_FEED else "off (feed disabled)", "login": "",
     "reconnect": "",            # 本次运行选的重连机制（strict / carry-over）
+    "seat_mode": "",            # 本次运行选的座位模式（fixed 1 seat / follow PDEV）
     "balance": None,            # 余额（HTTP 轮询）
     "currency": "MYR",
     "conn_secs": 0.0,           # 这张桌的已连接时长（秒）
@@ -672,7 +682,8 @@ def render():
              row("PP AutoBot"),
              row(f"{'Table':<9} : {UI['table']}"),
              row(f"{'Min bet':<9} : {UI['min_bet'] or '?'}"),
-             row(f"{'My seat':<9} : {seat_disp(UI['my_seat'])}"),
+             row(f"{'My seat':<9} : {seat_disp(UI['my_seat'])}"
+                 + (f"  ({UI['seat_mode']})" if UI['seat_mode'] else "")),
              row(f"{'Balance':<9} : {UI.get('currency') or 'MYR'} "
                  f"{UI['balance'] if UI['balance'] is not None else '—'}",
                  Fore.YELLOW),
@@ -697,7 +708,8 @@ def render():
              row("PP AutoBot"),
              row(f"{'Table':<9} : {UI['table']}"),
              row(f"{'Min bet':<9} : {UI['min_bet'] or '?'}"),
-             row(f"{'My seat':<9} : {seat_disp(UI['my_seat'])}"),
+             row(f"{'My seat':<9} : {seat_disp(UI['my_seat'])}"
+                 + (f"  ({UI['seat_mode']})" if UI['seat_mode'] else "")),
              row(f"{'Balance':<9} : {UI.get('currency') or 'MYR'} "
                  f"{UI['balance'] if UI['balance'] is not None else '—'}",
                  Fore.YELLOW),
@@ -804,7 +816,8 @@ def ask_pasted_jsid():
 # 存在 exe（或 main.py）同目录的 last_inputs.json；读不到就按「首次」走，绝不报错。
 # 规则：直接回车 = 沿用上次输入的那一项（没有上次 = 该项不带值 / 不设限）
 #       Bet 额外：输入 0 = 用该桌最低限额（auto）
-_LAST_INPUTS = {"bet": None, "upper": None, "lower": None, "mode": None, "loaded": False}
+_LAST_INPUTS = {"bet": None, "upper": None, "lower": None, "mode": None,
+                "seat_mode": None, "loaded": False}
 
 
 def _last_inputs_path() -> Path:
@@ -820,12 +833,16 @@ def _load_last_inputs() -> dict:
     try:
         with open(_last_inputs_path(), encoding="utf-8") as f:
             d = json.load(f) or {}
-        for k in ("bet", "upper", "lower", "mode"):
+        for k in ("bet", "upper", "lower", "mode", "seat_mode"):
             v = d.get(k)
             if isinstance(v, bool) or not isinstance(v, (int, float)):
                 continue
             if k == "mode":
                 if int(v) in RECONNECT_MODES:      # 只认 1 / 2，别的当没选过
+                    _LAST_INPUTS[k] = int(v)
+                continue
+            if k == "seat_mode":
+                if int(v) in SEAT_MODES:           # 只认 1 / 2，别的当没选过
                     _LAST_INPUTS[k] = int(v)
                 continue
             _LAST_INPUTS[k] = float(v)
@@ -839,9 +856,10 @@ def _save_last_inputs(**kv):
     _load_last_inputs()
     _LAST_INPUTS.update(kv)
     try:
-        out = {k: _LAST_INPUTS[k] for k in ("bet", "upper", "lower", "mode")}
-        if out.get("mode") is not None:
-            out["mode"] = int(out["mode"])         # 存成整数，读回来好校验
+        out = {k: _LAST_INPUTS[k] for k in ("bet", "upper", "lower", "mode", "seat_mode")}
+        for k in ("mode", "seat_mode"):
+            if out.get(k) is not None:
+                out[k] = int(out[k])               # 存成整数，读回来好校验
         with open(_last_inputs_path(), "w", encoding="utf-8") as f:
             json.dump(out, f, ensure_ascii=False)
     except Exception:
@@ -887,6 +905,36 @@ def ask_bet_amount() -> int:
         log(f"  [💰] Bet amount: {amt} (fixed for every round)", Fore.GREEN)
         _save_last_inputs(bet=amt)
         return amt
+
+
+def ask_seat_mode() -> int:
+    """座位模式：1 = 永久只打 1 个位；2 = 跟 PDEV 走（>0 最多 MAX_SEATS_PER_TABLE 位，<=0 1 位）。
+
+    回车 = 上次选过的（没有上次 = SEAT_MODE_DEFAULT，当前是 2）。
+    """
+    last = _load_last_inputs().get("seat_mode") or SEAT_MODE_DEFAULT
+    hint = f"{last} = {SEAT_MODES[last]}"
+    print("  Seat mode  (1 = always 1 seat , 2 = follow PDEV):")
+    while True:
+        try:
+            raw = input(f"  Seats [{hint}]: ").strip()
+        except EOFError:
+            raise RuntimeError("no seat mode entered")
+        if not raw:
+            mode = last
+        elif raw in ("1", "2"):
+            mode = int(raw)
+        else:
+            print("  Only 1 or 2 — enter again:")
+            continue
+        break
+    if mode == SEAT_MODE_FIXED:
+        log("  [🪑] Seat mode: fixed — 永远只打 1 个座位（不看 PDEV）", Fore.GREEN)
+    else:
+        log(f"  [🪑] Seat mode: follow PDEV — PDEV > 0 最多 {MAX_SEATS_PER_TABLE} 个位，"
+            f"PDEV <= 0 只打 1 个", Fore.GREEN)
+    _save_last_inputs(seat_mode=mode)
+    return mode
 
 
 def _parse_money(raw):
@@ -1549,7 +1597,12 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
             能坐几个算几个：空位不够就少坐，不等待、不抢位。"""
             pdev = UI.get("pdev")
             txt = f"{pdev:+.7f}" if isinstance(pdev, (int, float)) else "—"
-            target = MAX_SEATS_PER_TABLE if (isinstance(pdev, (int, float)) and pdev > 0) else 1
+            if SEAT_MODE["v"] == SEAT_MODE_FIXED:
+                target = 1                      # 永久 1 个位：完全不看 PDEV
+                why = "fixed mode"
+            else:
+                target = MAX_SEATS_PER_TABLE if (isinstance(pdev, (int, float)) and pdev > 0) else 1
+                why = f"PDEV {txt}"
             # 迟迟没确认的 sitdown 直接丢掉，否则会一直被当成「已经坐着」而不补位
             now = time.monotonic()
             for s in [s for s, t in my_pending.items() if now - t > SIT_CONFIRM_TIMEOUT]:
@@ -1567,7 +1620,7 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                         await leave_seat(s)
                     else:
                         my_pending.pop(s, None)
-                log(f"  [💺] {tag}: PDEV {txt} → target {target}, left {len(cur) - target} seat(s)",
+                log(f"  [💺] {tag}: {why} → target {target}, left {len(cur) - target} seat(s)",
                     Fore.MAGENTA)
                 return
             if len(cur) < target:
@@ -1579,7 +1632,7 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                 for s in pick:
                     await sit_seat(s)
                 short = "" if len(pick) == need else f" (only {len(pick)} free, wanted {need})"
-                log(f"  [💺] {tag}: PDEV {txt} → target {target}, sitting {len(pick)} more seat(s){short}",
+                log(f"  [💺] {tag}: {why} → target {target}, sitting {len(pick)} more seat(s){short}",
                     Fore.MAGENTA)
 
         async def place_bet_later(gid):
@@ -2058,6 +2111,10 @@ async def main():
     log("  [👤] Login: pasted URL", Fore.CYAN)
     UI["login"] = "pasted URL"
     pasted_sid, pasted_tid = ask_pasted_jsid()
+    seat_mode = ask_seat_mode()        # 1 = 永久 1 个位；2 = 跟 PDEV 走
+    SEAT_MODE["v"] = seat_mode
+    UI["seat_mode"] = ("fixed 1 seat" if seat_mode == SEAT_MODE_FIXED
+                       else f"PDEV max {MAX_SEATS_PER_TABLE}")
     bet_amount = ask_bet_amount()      # 固定注额；None = 用该桌最低限额
 
     if USE_BALANCE_LIMIT:

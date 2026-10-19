@@ -70,6 +70,7 @@ async def run():
     main.BET_DELAY_MIN = main.BET_DELAY_MAX = 0.2
     main.SIT_CONFIRM_TIMEOUT = 3
     main.UI["active"] = False
+    main.SEAT_MODE["v"] = main.SEAT_MODE_PDEV
 
     pdev = {"v": 0.02}
     main.update_pdev = lambda cards: main.UI.update({"pdev": pdev["v"], "pdev_issued": "test"})
@@ -132,6 +133,37 @@ async def run():
     print("\n✅ 全部通过")
 
 
+async def run_fixed():
+    """座位模式 1（永久 1 个位）：PDEV 正数也不补位、不退位、只下 1 注"""
+    ws = FakeWS()
+    main.websockets.connect = lambda *a, **k: _Conn(ws)
+    main.SEAT_MODE["v"] = main.SEAT_MODE_FIXED
+    main.UI["pdev"] = 0.02
+    main.update_pdev = lambda cards: main.UI.update({"pdev": 0.02, "pdev_issued": "test"})
+    carry = {"cards": ["2"] * 40, "tc": 2.0, "seat": None}
+
+    task = asyncio.create_task(main.listen_table("TEST2", "wss://x/y", 10, 10, carry))
+    ws.push({"subscribe": {"channel": "table-test2"}})
+    await asyncio.sleep(3.4)
+    first = sitdowns(ws)
+    print("⑥ [fixed 1 seat] 初次坐下请求:", first)
+    assert len(first) == 1, "初次应只坐 1 个位"
+    ws.push({"seat": {"num": int(first[0]), "event": "sit", "user_id": "U1", "screen_name": "me"}})
+    await asyncio.sleep(0.2)
+
+    ws.push({"betsopen": {"game": "f1"}})
+    await asyncio.sleep(1.0)
+    print("⑦ [fixed 1 seat] PDEV +0.02 → sitdown / unseat:", sitdowns(ws), unseats(ws))
+    assert len(sitdowns(ws)) == 1, f"固定模式不该补位，实际 {sitdowns(ws)}"
+    assert not unseats(ws), f"固定模式不该退位，实际 {unseats(ws)}"
+    print("⑧ [fixed 1 seat] 本局下注座位:", bets(ws))
+    assert len(bets(ws)) == 1, f"固定模式每局只应下 1 注，实际 {bets(ws)}"
+
+    ws.stop()
+    await asyncio.wait_for(task, timeout=5)
+    print("\n✅ 全部通过")
+
+
 class _Conn:
     def __init__(self, ws):
         self.ws = ws
@@ -146,6 +178,7 @@ class _Conn:
 if __name__ == "__main__":
     try:
         asyncio.run(run())
+        asyncio.run(run_fixed())
     except AssertionError as e:
         print("\n❌", e)
         sys.exit(1)
