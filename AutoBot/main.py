@@ -1502,8 +1502,10 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
     my_pending = {}           # 已发 sitdown、等服务器 sit 确认的座位号 → 发出时间（秒）
     leaving = set()           # 我们主动 unseat 的座位号（收到 stand 时不当作被踢）
     my_uid = {"v": None}      # 我们自己的 user_id（由坐下确认消息取得）
-    bet = {"pending": {}, "last_gid": None, "task": None, "amount": None, "ok_gid": None}
-    #                    待确认 gid（座位→gid）/ 本局已押 / 延时任务 / 本局主注额 / 最近一次确认过的 gid
+    bet = {"pending": {}, "last_gid": None, "task": None, "amount": None, "ok_gid": None,
+           "sent_gid": None, "sent_seats": set(), "sent_seats_gid": None}
+    #   待确认 gid（座位→gid）/ 本局基准 gid / 延时任务 / 本局主注额 / 最近确认过的 gid
+    #   / 真正发出过注的 gid / 本局已发过注的座位 / 那份座位表属于哪一局
 
     dealer = {"cards": []}    # 庄家已知牌（h0，第一张即明牌），供 EV 使用
     acted = set()             # 已提交过的动作 (座位号, decisionOffer.id)，同一格只动作一次
@@ -1650,31 +1652,49 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     Fore.MAGENTA)
 
         async def place_bet_later(gid):
-            """开局后随机延时 3-5 秒，再对每个已确认的座位各发一次主注（金额 = 用户指定值）"""
+            """开局后随机延时 3-5 秒 → 对每个「已确认」座位各发一次主注。
+            ★ 不再一遇到「座位还没确认 / uid 还没拿到」就直接放弃：
+              每 0.5 秒扫一次，最多 6 秒。这样补坐的位晚一点确认，也能在同一局补上下注。
+            """
             await asyncio.sleep(random.uniform(BET_DELAY_MIN, BET_DELAY_MAX))
-            # 刚补坐的位 sit 确认可能还没回来 → 最多再等 1 秒，免得这个位这一局漏下注
-            if my_pending:
-                for _ in range(20):
-                    if not my_pending:
-                        break
-                    await asyncio.sleep(0.05)
-            if bet["last_gid"] != gid or not my_seat["v"] or my_uid["v"] is None:
-                return
             amt = bet_amount if bet_amount else (min_bet or FALLBACK_BET)
-            sent = []
-            for seat in list(my_seat["v"]):
-                try:
-                    await ws.send(_lpbet(ch_holder["ch"], gid, seat, amt, my_uid["v"]))
-                except Exception:
+            for attempt in range(8):             # 3-5s 之后再扫 4 秒（发牌就不能再下注了）
+                if bet["last_gid"] != gid:
+                    if bet["sent_gid"] != gid:
+                        log(f"  [⚠️] Bet skipped — game {gid} already replaced by "
+                            f"{bet['last_gid']} before we could send", Fore.YELLOW)
                     return
-                bet["pending"][seat] = gid
-                sent.append(seat)
-            if not sent:
-                return
-            bet["amount"] = amt
-            UI["action"] = f"Main bet {amt} × {len(sent)} seat(s) — awaiting confirm…"
-            log(f"  [💵] Main bet {amt} sent on {len(sent)} seat(s) "
-                f"{seat_disp(sent)} (game {gid}) — awaiting confirm", Fore.YELLOW)
+                if str(bet["ok_gid"]) == str(gid):
+                    return                       # 本局已经发牌 → 下注窗口关了，不能再补
+                if my_uid["v"] is None or not my_seat["v"]:
+                    if attempt == 0:
+                        log(f"  [⏳] Bet waiting — seats={seat_disp(my_seat['v'])} "
+                            f"uid={my_uid['v']} (retry up to 4s)", Fore.YELLOW)
+                    await asyncio.sleep(0.5)
+                    continue
+                sent = []
+                if bet["sent_seats_gid"] != gid:
+                    bet["sent_seats_gid"] = gid
+                    bet["sent_seats"].clear()        # 新的一局 → 已发座位表清零
+                for seat in list(my_seat["v"]):
+                    if seat in bet["sent_seats"]:
+                        continue                     # 这个位本局已经发过了（确认后也不会重发）
+                    try:
+                        await ws.send(_lpbet(ch_holder["ch"], gid, seat, amt, my_uid["v"]))
+                    except Exception:
+                        return
+                    bet["pending"][seat] = gid
+                    bet["sent_seats"].add(seat)
+                    sent.append(seat)
+                if sent:
+                    bet["sent_gid"] = gid
+                    bet["amount"] = amt
+                    UI["action"] = (f"Main bet {amt} × {len(bet['sent_seats'])} seat(s) "
+                                    f"— awaiting confirm…")
+                    log(f"  [💵] Main bet {amt} sent on {len(sent)} seat(s) "
+                        f"{seat_disp(sent)} (game {gid}, uid {my_uid['v']}) — awaiting confirm",
+                        Fore.YELLOW)
+                await asyncio.sleep(0.5)
 
         def schedule_decision(ps: dict, seat: str):
             """轮到我：对本局这个座位上每个「正在活动且带 decisionOffer」的手，排一个延时动作"""
@@ -1783,6 +1803,11 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                 # ── 本局结束仍无我们座位的牌 → 判定被拒（兜底） ──
                 if "bjGameEnd" in d:
                     endg = str((d.get("bjGameEnd") or {}).get("id"))
+                    # 诊断：这一局我们一注都没发出去 → 明确喊出来，别让它静默过去
+                    if endg and str(bet["sent_gid"]) != endg:
+                        log(f"  [❌] Game {endg} ended with NO bet sent "
+                            f"(seats={seat_disp(my_seat['v'])} uid={my_uid['v']} "
+                            f"last_gid={bet['last_gid']})", Fore.RED)
                     pg = {str(v) for v in bet["pending"].values()}
                     # 一注都没确认过（ok_gid 也不是这一局）才算整桌被拒；部分确认只提示
                     if endg in pg and str(bet["ok_gid"]) not in pg:
@@ -1874,10 +1899,16 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     # ── 每局按「上一局结算完的 PDEV」调整座位数（只在进入新的一局时做）──
                     #    正 → 最多 MAX_SEATS_PER_TABLE 个位；非正 → 1 个位（能坐几个算几个）
                     if gid and gid != bet["last_gid"]:
+                        log(f"  [🎬] New game {gid} | seats={seat_disp(my_seat['v'])} "
+                            f"pending={len(my_pending)} uid={my_uid['v']}", Fore.CYAN)
                         await adjust_seats(f"game {gid}")
-                    # 已坐下且本局未押过 → 随机延时 3-5 秒押主注（只押主注）
-                    if gid and my_uid["v"] is not None and gid != bet["last_gid"]:
+                    # 已坐下且本局还没真正押出去 → 随机延时 3-5 秒押主注（只押主注）
+                    # ★ 用 sent_gid（真发出才算）而不是 last_gid（只是"本局基准"），
+                    #   这样补的位晚一步确认也不会让整局变成一注都没发
+                    if gid and my_uid["v"] is not None and gid != bet["sent_gid"]:
                         bet["last_gid"] = gid
+                        if bet["task"]:
+                            bet["task"].cancel()
                         bet["task"] = asyncio.create_task(place_bet_later(gid))
                     continue
 
