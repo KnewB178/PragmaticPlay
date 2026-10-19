@@ -549,6 +549,7 @@ UI = {
     "active": False,            # 进入主循环后才整屏渲染（之前正常逐行打印）
     "table": "—", "min_bet": None, "my_seat": None,
     "feed": "connecting…" if USE_FEED else "off (feed disabled)", "login": "",
+    "uid": "",                 # 登录 user_id（面板显示，不再逐局打印）
     "reconnect": "",            # 本次运行选的重连机制（strict / carry-over）
     "seat_mode": "",            # 本次运行选的座位模式（fixed 1 seat / follow PDEV）
     "balance": None,            # 余额（HTTP 轮询）
@@ -716,6 +717,7 @@ def render():
              row(f"{'Feed':<9} : {UI['feed']}"),
              row(f"{'Reconnect':<9} : {UI['reconnect'] or '—'}"),
              row(f"{'Login':<9} : {UI['login']}"),
+             row(f"{'UID':<9} : {UI['uid'] or '—'}"),
              "├" + bar + "┤",
              row(f"Shoe {UI['shoe_n']}/{SHOE_TOTAL}   {taken_txt}   TC {UI['tc']:+.2f}",
                  _tc_color(UI["tc"])),
@@ -738,6 +740,7 @@ def render():
              row(f"{'Feed':<9} : {UI['feed']}"),
              row(f"{'Reconnect':<9} : {UI['reconnect'] or '—'}"),
              row(f"{'Login':<9} : {UI['login']}"),
+             row(f"{'UID':<9} : {UI['uid'] or '—'}"),
              "├" + bar + "┤",
              row(f"Shoe {UI['shoe_n']}/{SHOE_TOTAL}   {taken_txt}   TC {UI['tc']:+.2f}",
                  _tc_color(UI["tc"])),
@@ -1706,8 +1709,8 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                 if my_uid["v"] is None or not my_seat["v"]:
                     if not warned[0]:
                         warned[0] = True
-                        log(f"  [⏳] Bet waiting — seats={seat_disp(my_seat['v'])} "
-                            f"uid={my_uid['v']}", Fore.YELLOW)
+                        log(f"  [⏳] Bet waiting — seats={seat_disp(my_seat['v'])}",
+                            Fore.YELLOW)
                     await asyncio.sleep(0.1)
                     continue
 
@@ -1743,7 +1746,7 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                                 f"— awaiting confirm…")
                 log(f"  [💵] Main bet {amt} sent at {now - t0:.1f}s on {len(seats)} "
                     f"seat(s) {seat_disp(seats)} in one command "
-                    f"(game {gid}, uid {my_uid['v']}) — awaiting confirm", Fore.YELLOW)
+                    f"(game {gid}) — awaiting confirm", Fore.YELLOW)
                 return
 
         def schedule_decision(ps: dict, seat: str):
@@ -1974,8 +1977,6 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     # ── 每局按「上一局结算完的 PDEV」调整座位数（只在进入新的一局时做）──
                     #    正 → 最多 MAX_SEATS_PER_TABLE 个位；非正 → 1 个位（能坐几个算几个）
                     if gid and gid != bet["last_gid"]:
-                        log(f"  [🎬] New game {gid} | seats={seat_disp(my_seat['v'])} "
-                            f"pending={len(my_pending)} uid={my_uid['v']}", Fore.CYAN)
                         await adjust_seats(f"game {gid}")
                     # 已坐下且本局还没真正押出去 → 随机延时 3-5 秒押主注（只押主注）
                     # ★ 用 sent_gid（真发出才算）而不是 last_gid（只是"本局基准"），
@@ -2115,9 +2116,10 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                                 my_seat["v"].append(num)
                             if my_uid["v"] is None:
                                 my_uid["v"] = s.get("user_id")
+                                UI["uid"] = str(my_uid["v"] or "")
                             UI["my_seat"] = list(my_seat["v"])
                             log(f"  [✅] Seat confirmed: {seat_disp(num)} "
-                                f"(user_id={my_uid['v']}) — {len(my_seat['v'])} seat(s) now", Fore.GREEN)
+                                f"— {len(my_seat['v'])} seat(s) now", Fore.GREEN)
                     elif ev == "stand":
                         occupied.pop(num, None)
                         UI["occupy"].pop(num, None)
