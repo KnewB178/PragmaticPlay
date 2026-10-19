@@ -611,11 +611,16 @@ def _tc_color(v: float) -> str:
 PDEV_BASELINE = -0.006476944408866543   # 满靴（0 张已出）的 PDEV —— 用来判断「比新靴好还是差」
 
 
+def pdev_pct(v) -> str:
+    """PDEV 小数 → 百分比文本（−0.005331 → −0.5331%），保留符号"""
+    return f"{v * 100:+.4f}%"
+
+
 def _pdev_txt() -> str:
     v = UI.get("pdev")
     if v is None:
         return "—"
-    return f"{v:+.7f} [{UI.get('pdev_issued')}]"
+    return f"{pdev_pct(v)} [{UI.get('pdev_issued')}]"
 
 
 def _pdev_color() -> str:
@@ -1612,7 +1617,7 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
             PDEV > 0 → 最多 MAX_SEATS_PER_TABLE 个位；PDEV <= 0 → 1 个位。
             能坐几个算几个：空位不够就少坐，不等待、不抢位。"""
             pdev = UI.get("pdev")
-            txt = f"{pdev:+.7f}" if isinstance(pdev, (int, float)) else "—"
+            txt = pdev_pct(pdev) if isinstance(pdev, (int, float)) else "—"
             if SEAT_MODE["v"] == SEAT_MODE_FIXED:
                 target = 1                      # 永久 1 个位：完全不看 PDEV
                 why = "fixed mode"
