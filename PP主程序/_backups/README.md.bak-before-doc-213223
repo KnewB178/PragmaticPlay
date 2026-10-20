@@ -1,0 +1,86 @@
+# 198198.io 自动登录
+
+使用 `requests` 直接调用网站的登录接口，不需要浏览器自动化。
+
+## Windows 上运行
+
+1. 安装 Python 3.9 或更高版本，安装时勾选 “Add Python to PATH”。
+2. 打开命令提示符，进入本目录后安装依赖：
+
+```bat
+pip install -r requirements.txt
+```
+
+3. 编辑 `config.ini`，填入账号密码和要获取的 URL。
+4. 运行：
+
+```bat
+python login_198198.py
+```
+
+## 查看和进入游戏
+
+登录后列出账号可玩的游戏：
+
+```bat
+python login_198198.py --list-games
+```
+
+按名称或代码过滤：
+
+```bat
+python login_198198.py --find Speed
+```
+
+直接进入某个游戏并输出游戏 URL 和 URL 参数：
+
+```bat
+python login_198198.py --game PGS_135
+python login_198198.py --game 402
+python login_198198.py --game ig-33
+```
+
+`--game` 会调用网站的 `/api/playGame` 接口，打印 `loadUrl`，并把它查询字符串里的参数（例如 `gameCode`、`uuid`、`token`）解析成 JSON 显示。
+
+## 自动抓取百家乐桌的 wss URL
+
+先安装 Playwright 的浏览器内核：
+
+```bat
+python -m playwright install chromium
+```
+
+然后运行：
+
+```bat
+python blackjack_wss.py
+```
+
+程序会自动登录，从 Pragmatic Play 真人游戏里直接选一张百家乐桌进入，抓取游戏建立的 `wss://` 连接，并把完整 URL 写入同目录的 `WS_Config.txt`。
+
+支持批量账号：程序会自动按前缀和范围生成用户名，不需要逐个列出。`config.ini` 配置如下：
+
+```ini
+[198198]
+username_prefix = EyeBot_
+username_start = 01
+username_end = 15
+password = 统一密码
+```
+
+上面的配置会生成 `EyeBot_01` 到 `EyeBot_15` 这 15 个用户名，密码统一使用 `password`。程序会并发处理这些账号，所有账号的 wss URL 都写入同一个 `WS_Config.txt`，txt 里只保留 URL，不包含账号名。
+
+多个账号会同时处理（默认 3 个并发，可用 `--workers 5` 调整），全部抓完后才一次性写入 `WS_Config.txt`，不会边抓边写。
+
+也可以指定游戏代码/名称：
+
+```bat
+python blackjack_wss.py --game 402
+```
+
+## 说明
+
+- 密码在本地用网站要求的 AES 方式加密后再发送，不会明文出现在请求里。
+- `target_url` 留空则只登录并输出 token，不请求页面。
+- 登录成功后脚本会把 token 作为请求头附加到会话，再请求目标页面。
+- 脚本会打印会员名、token，以及目标页面的最终 URL。

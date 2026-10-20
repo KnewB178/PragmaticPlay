@@ -1,0 +1,871 @@
+import os, sys, json, asyncio, time, warnings
+import configparser
+import subprocess
+from datetime import datetime
+from pathlib import Path
+
+import aiohttp
+from aiohttp import web
+import paho.mqtt.client as mqtt
+import importlib.util as _pp_util
+
+BASE_DIR = Path(__file__).resolve().parent
+
+# 加载 EV 计算函数
+_pp_ev_spec = _pp_util.spec_from_file_location("pp_ev", str(BASE_DIR / "PP EV.py"))
+_pp_ev_mod = _pp_util.module_from_spec(_pp_ev_spec)
+_pp_ev_spec.loader.exec_module(_pp_ev_mod)
+calc_ev = _pp_ev_mod.calc_ev
+
+MQTT_HOST = "127.0.0.1"
+MQTT_PORT = 8881
+MQTT_USER = "MQTT@@##admin"
+MQTT_PASS = "MQTT@@##admin"
+MQTT_KEEPALIVE = 120
+MQTT_TOPICS = [
+    ("pp/table/#", 1), ("pp/decision/#", 1),
+    ("pp/gameend/#", 1), ("pp/offertimer/#", 1),
+]
+HTTP_PORT = 8888
+
+# ─── 静音 Windows 上 asyncio 的 ConnectionResetError 刷屏 ───
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+class Broadcaster:
+    def __init__(self):
+        self._clients = set()
+        self._lock = asyncio.Lock()
+    async def add(self, ws):
+        async with self._lock: self._clients.add(ws)
+    async def remove(self, ws):
+        async with self._lock: self._clients.discard(ws)
+    async def send(self, msg_type, payload):
+        msg = json.dumps({"type": msg_type, "payload": payload})
+        dead = set()
+        async with self._lock:
+            for ws in self._clients:
+                try: await ws.send_str(msg)
+                except: dead.add(ws)
+            self._clients -= dead
+    @property
+    def count(self): return len(self._clients)
+
+broadcast = Broadcaster()
+main_loop = None
+
+class MqttState:
+    def __init__(self):
+        self.connected = False
+        self.total_msgs = 0
+        self.last_msg_time = None
+        self.reconnects = 0
+        self.last_disconnect_reason = ""
+
+state = MqttState()
+
+def start_mqtt():
+    c = mqtt.Client(protocol=mqtt.MQTTv311)
+
+    def on_connect(client, userdata, flags, rc):
+        state.connected = (rc == 0)
+        if rc == 0:
+            print(f"  [✅] MQTT Connected {MQTT_HOST}:{MQTT_PORT}")
+            client.subscribe(MQTT_TOPICS)
+        else:
+            print(f"  [❌] MQTT 连接失败 rc={rc}")
+        asyncio.run_coroutine_threadsafe(
+            broadcast.send("status", {
+                "mqtt": "connected" if rc == 0 else f"fail:{rc}",
+                "reconnects": state.reconnects,
+                "total_msgs": state.total_msgs,
+                "last_msg": state.last_msg_time,
+            }), main_loop)
+
+    def on_disconnect(client, userdata, rc):
+        state.connected = False
+        state.reconnects += 1
+        reason = {0: "正常断开", 1: "协议错误", 2: "被拒绝",
+                  3: "服务器关闭", 4: "超时"}.get(rc, f"未知({rc})")
+        state.last_disconnect_reason = reason
+        print(f"  [⚠️] MQTT 断开 ({reason}), 尝试重连...")
+        asyncio.run_coroutine_threadsafe(
+            broadcast.send("status", {
+                "mqtt": "disconnected", "disconnect_reason": reason,
+                "reconnects": state.reconnects,
+                "total_msgs": state.total_msgs,
+                "last_msg": state.last_msg_time,
+            }), main_loop)
+        delay = min(2 ** (state.reconnects % 6), 30)
+        time.sleep(delay)
+        try:
+            client.connect(MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE)
+            print(f"  [🔄] 重连成功")
+        except Exception as e:
+            print(f"  [❌] 重连失败: {e}")
+
+    def on_message(client, userdata, msg):
+        state.total_msgs += 1
+        now = datetime.now().strftime("%H:%M:%S")
+        state.last_msg_time = now
+        try:
+            payload = json.loads(msg.payload)
+        except json.JSONDecodeError:
+            payload = {"raw": msg.payload.decode("utf-8", errors="replace")}
+        data = {"topic": msg.topic, "time": now, "payload": payload}
+        asyncio.run_coroutine_threadsafe(
+            broadcast.send("mqtt_msg", data), main_loop)
+
+    c.on_connect = on_connect
+    c.on_disconnect = on_disconnect
+    c.on_message = on_message
+    c.username_pw_set(MQTT_USER, MQTT_PASS)
+    try:
+        c.connect(MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE)
+        c.loop_start()
+        return c
+    except Exception as e:
+        print(f"  [❌] MQTT 启动失败: {e}")
+        return None
+
+RESTART_COOLDOWN_SECONDS = 60
+_last_restart_at = 0.0
+
+
+def restart_password() -> str:
+    try:
+        parser = configparser.ConfigParser()
+        parser.read(BASE_DIR / "config.ini", encoding="utf-8")
+        return parser.get("web", "restart_password", fallback="PragmaticPlay").strip()
+    except Exception:
+        return "PragmaticPlay"
+
+
+def restart_seconds_left() -> int:
+    return max(0, int(RESTART_COOLDOWN_SECONDS - (time.time() - _last_restart_at)))
+
+
+def restart_chain_running() -> bool:
+    try:
+        if os.name == "nt":
+            cmd = (
+                "Get-CimInstance Win32_Process | "
+                "Where-Object { $_.CommandLine -like '*restart_chain.py*' -and $_.ProcessId -ne $PID } | "
+                "ForEach-Object { $_.ProcessId }"
+            )
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", cmd],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout
+            return any(line.strip().isdigit() for line in out.splitlines())
+        out = subprocess.run(
+            ["pgrep", "-f", "restart_chain.py"],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        return bool(out.strip())
+    except Exception:
+        return False
+
+
+HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pragmatic Play Blackjack</title>
+<style>
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0d1117;--bg-card:#161b22;--bg-hover:#1c2128;
+  --border:#21262d;--text:#e6edf3;--text-dim:#8b949e;--text-faint:#484f58;
+  --accent:#58a6ff;--green:#3fb950;--red:#f85149;--yellow:#d29922;
+  --radius:8px;
+}
+html{font-size:14px}
+body{
+  display:flex;flex-direction:column;height:100vh;
+  font-family:-apple-system,BlinkMacSystemFont,"SF Mono","Segoe UI",monospace;
+  background:var(--bg);color:var(--text);
+}
+header{
+  position:sticky;top:0;z-index:90;
+  display:flex;align-items:center;justify-content:space-between;
+  padding:12px 20px;border-bottom:1px solid var(--border);
+  flex-wrap:wrap;gap:8px
+}
+header h1{font-family:Georgia,"Times New Roman",serif;font-size:22px;font-weight:700;display:flex;align-items:center;gap:6px;letter-spacing:.3px;background:linear-gradient(135deg,#e6edf3 0%,#58a6ff 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}header h1 .spade{font-size:26px;line-height:1;background:linear-gradient(135deg,#3fb950,#58a6ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.header-right{display:flex;align-items:center;gap:14px;font-size:12px;color:var(--text-dim);flex-wrap:wrap}
+.badge{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:6px 14px;border-radius:14px;font-size:13px;min-width:150px}
+.badge .dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.badge.green{background:#162820;color:var(--green);box-shadow:0 0 16px rgba(63,185,80,.5)}
+.badge.green .dot{background:var(--green);box-shadow:0 0 4px #3fb95088}
+.badge.yellow{background:#1e1b12;color:var(--yellow)}
+.badge.yellow .dot{background:var(--yellow);box-shadow:0 0 4px #d2992288}
+.badge.red{background:#3d1515;color:#ff6b6b;border:1px solid #ff444488}
+.badge.red .dot{background:var(--red);box-shadow:0 0 4px #f8514988}
+.badge.gray{background:#161b22;color:var(--text-faint)}
+.badge.gray .dot{background:var(--text-faint)}
+.header-stat{display:flex;align-items:center;gap:4px;cursor:pointer}
+input[type="text"]{
+  background:var(--bg-card);border-radius:6px;
+  padding:3px 8px;color:var(--text);font-size:11px;width:120px;font-family:inherit
+}
+input[type="text"]:focus{outline:none;border-color:var(--accent)}
+.btn{
+  background:var(--bg-card);color:var(--text-dim);
+  border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;font-family:inherit
+}
+.btn:hover{background:var(--bg-hover);color:var(--text)}
+.btn.danger{color:var(--red)}
+.btn.danger:hover{background:#2d1b1b;border-color:var(--red)}
+select{
+  background:var(--bg-card);border-radius:6px;
+  padding:3px 8px;color:var(--text);font-size:11px;font-family:inherit;cursor:pointer
+}
+select:focus{outline:none;border-color:var(--accent)}
+.dashboard{flex:1;overflow-y:auto;scrollbar-width:none;-ms-overflow-style:none;padding:12px 20px}
+.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}
+.table-card{
+  background:var(--bg-card);border-radius:var(--radius);
+  padding:12px 14px;transition:border-color .15s
+}
+.table-card:hover{border-color:#30363d}
+.user-btn{background:#161b22;border:none;color:var(--text-faint);padding:6px 14px;border-radius:14px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:6px;font-size:13px;min-width:150px}
+.user-btn:hover{background:#1a1f24}
+.user-btn.tracking{background:#162820;color:#3fb950;box-shadow:0 0 16px rgba(63,185,80,.5)}
+.table-card .head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.table-card .name{font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.table-card .tc{font-size:24px;font-weight:700;font-variant-numeric:tabular-nums}
+.tc-p{color:var(--green)}.tc-n{color:var(--red)}.tc-z{color:var(--text-dim)}
+.table-card .info{display:flex;align-items:center;justify-content:space-between;font-size:11px;color:var(--text-dim);margin-bottom:6px;flex-wrap:wrap}
+.table-card .info .l{color:var(--text-faint)}
+
+
+.card-chip{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:22px;height:30px;border-radius:3px;font-size:10px;font-weight:700;
+  background:#1a1f29;color:var(--text-faint);font-family:inherit
+}
+.card-chip.r{color:var(--red);border-color:#4a1f1f;background:#261515}
+.empty-state{text-align:center;color:var(--text-faint)}
+.empty-state .icon{font-size:200px;margin-bottom:20px;line-height:1}
+.empty-state p{font-size:16px}
+.dashboard::-webkit-scrollbar{display:none}
+.player-panel{position:fixed;bottom:0;left:0;right:0;background:var(--bg-card);border-top:1px solid var(--border);z-index:80;box-shadow:0 -4px 20px rgba(0,0,0,.4)}
+.pp-hdr{display:flex;align-items:center;justify-content:space-between;padding:8px 16px;border-bottom:1px solid var(--border);position:relative}
+.pp-hdr .pp-dealer{position:absolute;left:50%;transform:translateX(-50%);white-space:nowrap}
+.pp-hdr .pp-title{font-size:14px;font-weight:600}
+.pp-body{display:grid;grid-template-columns:repeat(7,1fr);gap:4px;padding:8px 12px}
+.pp-col{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 8px}
+.pp-col.tracked{border-color:#3fb950;box-shadow:0 0 12px rgba(63,185,80,.4)}
+.pp-col .pp-top{display:flex;align-items:center;gap:4px;margin-bottom:3px}
+.pp-col .pp-seat{font-size:11px;font-weight:600;color:var(--text-dim);margin-right:8px}
+.pp-col .pp-pname{font-size:10px;color:var(--yellow);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pp-col .pp-hand{margin-bottom:3px}
+.pp-col .pp-hand:last-child{margin-bottom:0}
+.pp-col .pp-hand-cards{display:flex;flex-wrap:wrap;align-items:center;gap:2px}
+.pp-col .pp-hand-score{font-size:13px;font-weight:600;margin-left:6px}
+.pp-hdr .pp-dealer{font-size:12px;color:var(--text);display:flex;align-items:center;gap:4px}
+.pp-hdr .pp-dealer .card-chip{width:18px;height:24px;font-size:8px}
+.pp-hdr .pp-dealer .dscore{font-size:13px;font-weight:600;}
+.pp-col .pp-hand-score.g{color:var(--green)}.pp-col .pp-hand-score.b{color:var(--red)}.pp-col .pp-hand-score.z{color:var(--text)}.pp-hand-score.g{color:var(--green)}.pp-hand-score.b{color:var(--red)}.pp-hand-score.z{color:var(--text)}
+.dscore.g{color:var(--green)}.dscore.b{color:var(--red)}.dscore.z{color:var(--text)}
+.pp-col .pp-empty{color:var(--text-faint);font-size:11px;text-align:center;padding:12px 0}
+.pp-col .card-chip{width:20px;height:26px;font-size:8px}
+.pp-ev-wrap{display:flex;gap:2px;margin-top:3px;width:100%;min-height:25px;align-items:center}
+.pp-ev-cell{flex:1;padding:2px 4px;border-radius:4px;font-size:11px;text-align:center;background:var(--bg);color:var(--text-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.4}
+.pp-ev-cell.hit{background:#162820;color:var(--green);border:1px solid #3fb950}
+.pp-ev-cell.stand{background:#3d1515;color:var(--red);border:1px solid #f85149}
+.pp-ev-cell.double{background:#2a1b0e;color:#ff8c00;border:1px solid #ff8c00}
+.pp-ev-cell.cashout{background:#2a220a;color:#ffd700;border:1px solid #ffd700}
+.pp-ev-cell.split{background:#0c1a2e;color:#58a6ff;border:1px solid #58a6ff}
+.pp-ev-cell.best{border-width:1.5px}
+.pp-ev-cell.sec{color:var(--text-faint);border:1px solid var(--border)}
+@media(max-width:768px){.pp-body{grid-template-columns:repeat(4,1fr)}}
+@media(max-width:480px){.pp-body{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:1200px){.grid{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:640px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<header>
+  <h1><span class="spade">&spades;</span><br>Pragmatic Play Blackjack    <span class="header-stat"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg> <strong id="table-count">0</strong></span></h1>
+  <div class="header-right">
+    <button class="user-btn" id="user-btn" title="Track player"><svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg> <span id="user-label">Player</span></button>
+    <button class="user-btn" id="restart-btn" title="Restart main program"><svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg> <span id="restart-label">Reboot</span></button>
+    <span class="badge gray" id="mqtt-badge"><svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg> <span id="mqtt-label">Connecting...</span></span>
+  </div>
+</header>
+
+
+
+<div class="dashboard">
+  <div class="grid" id="table-grid">
+    <div class="empty-state">
+      <div class="icon">&#x1F4E1;</div>
+      <p>Awaiting data...</p>
+    </div>
+  </div>
+</div>
+
+<div class="player-panel" id="player-panel">
+  <div class="pp-hdr">
+    <span class="pp-title" id="pp-title">Table</span>
+    <div class="pp-dealer" id="pp-dealer"></div>
+  </div>
+  <div class="pp-body" id="pp-body"></div>
+</div>
+
+<script>
+const $=s=>document.querySelector(s)
+const tables={}
+const evCache={}
+let ws=null, curPlayerTable=null, sortMode='tc_desc'
+const debounceTimers = {}
+let followedPlayer = localStorage.getItem('ppFollowedPlayer') || ''
+let followedBet = localStorage.getItem('ppFollowedBet') || ''
+
+function connect(){
+  const url=location.protocol==='https:'?'wss://':'ws://'+location.host+'/ws'
+  ws=new WebSocket(url)
+  ws.onopen=()=>{}
+  ws.onmessage=e=>{
+    try{
+      const m=JSON.parse(e.data)
+      if(m.type==='mqtt_msg' && m.payload.topic && m.payload.topic.startsWith('pp/table/')){
+        const topic = m.payload.topic
+        if(debounceTimers[topic]) clearTimeout(debounceTimers[topic])
+        debounceTimers[topic] = setTimeout(function(){
+          delete debounceTimers[topic]
+          handleMsg(m.payload)
+        }, 250)
+      } else {
+        if(m.type==='mqtt_msg') handleMsg(m.payload)
+        else if(m.type==='status') handleStatus(m.payload)
+      }
+    }catch(_){}
+  }
+  ws.onclose=()=>{setBadge('gray','Disonnected');setTimeout(connect,3000)}
+  ws.onerror=()=>{ws.close()}
+}
+
+function setBadge(clr,label){
+  const b=$('#mqtt-badge')
+  b.className='badge '+clr
+  $('#mqtt-label').textContent=label||clr
+}
+
+function handleStatus(s){
+  if(s.mqtt==='connected'){setBadge('green','Connected')}
+  else{
+    setBadge('red','Disconnected')
+    // Clear all tables when disconnected
+    Object.keys(tables).forEach(k=>delete tables[k])
+    render()
+  }
+}
+
+function handleMsg(d){
+  if(d.topic.startsWith('pp/table/')){
+    const name=d.topic.replace('pp/table/','')
+    const p=d.payload||{}
+    var oldTable=tables[name]
+    tables[name]={
+      tc:p.tc??0, total:p.total??0, pdev:(p.pdev??null),
+      cards:p.cards||[],
+      dealer:p.dealer||{},
+      players:p.players||{},
+      player_names:p.player_names||{},
+      time:d.time,
+      gameEnded: false
+    }
+    // Preserve cashOut values from old data if missing in new data
+    // Skip when new payload is empty (betsopen round reset)
+    var hasPlayers=p.players&&Object.keys(p.players).length>0
+    if(oldTable&&oldTable.players&&hasPlayers){
+      for(var k in oldTable.players){
+        var oc=oldTable.players[k]
+        if(oc.cashOut===undefined) continue
+        var np=tables[name].players[k]
+        if(!np) continue
+        if(np.cashOut!==undefined) continue
+        // No cashOut in new data - check if cards changed
+        if((oc.cards||[]).join(',')===(np.cards||[]).join(',')){
+          np.cashOut=oc.cashOut
+        }
+        // If cards changed, player made a decision, don't preserve
+      }
+    }
+    render()
+    if(curPlayerTable&&curPlayerTable===name) renderPlayerPanel(name)
+    
+    // Auto-follow: if tracking a player and they are on this table, switch
+    if(followedPlayer){
+      var pnames = tables[name]?.player_names || {}
+      if(Object.values(pnames).some(function(v){return v.includes(followedPlayer)})){
+        togglePlayerPanel(name)
+      }
+    }
+  }
+  
+  if(d.topic.startsWith('pp/gameend/')){
+    // gameEnd handled - no gray-out feature
+  }
+  const cnt=Object.keys(tables).length
+  $('#table-count').textContent=cnt
+  // Update tracking indicator based on whether player is found at any table
+  if(followedPlayer){
+    var _f=false
+    for(var _t in tables){
+      var _n=tables[_t].player_names||{}
+      if(Object.values(_n).some(function(v){return v.includes(followedPlayer)})){_f=true;break}
+    }
+    $('#user-btn').classList.toggle('tracking',_f)
+  }
+}
+
+function render(){
+  const grid=$('#table-grid'), filter=''
+  const sort=sortMode
+  let entries=Object.entries(tables)
+  if(filter) entries=entries.filter(([n])=>n.toLowerCase().includes(filter))
+  if(sort==='name') entries.sort((a,b)=>a[0].localeCompare(b[0],void 0,{numeric:true}))
+  else if(sort==='tc_desc') entries.sort((a,b)=>{const pa=a[1].players?Object.keys(a[1].players).length:0;const pb=b[1].players?Object.keys(b[1].players).length:0;if(pa>=7&&pb<7)return 1;if(pb>=7&&pa<7)return -1;return b[1].tc-a[1].tc})
+  if(!entries.length){
+    grid.style.display='flex';grid.style.alignItems='center';grid.style.justifyContent='center';grid.style.height='100%'
+    grid.innerHTML='<div class="empty-state"><div class="icon">&#x1F4E1;</div><p>Awaiting data...</p></div>'
+    return
+  }
+  grid.style.display='';grid.style.alignItems='';grid.style.justifyContent='';grid.style.height=''
+  let html=''
+  for(const[name,d]of entries){
+    const tc=d.tc??0
+    const pdv=(d.pdev==null?null:Number(d.pdev)*100)
+    const pcls=pdv==null?'tc-z':pdv>0?'tc-p':pdv<0?'tc-n':'tc-z'
+    const psign=(pdv!=null&&pdv>0)?'+':''
+    const tcsign=tc>0?'+':''
+    const ts=d.time||'-'
+
+    const pc=d.players?Object.keys(d.players).length:0
+    html+='<div class="table-card">'
+      +'<div class="head"><div class="name" onclick="event.stopPropagation();togglePlayerPanel(\''+esc(name)+'\')">'+esc(name)+'</div><div class="tc '+pcls+'">'+(pdv==null?'-':psign+pdv.toFixed(3)+'%')+'</div></div>'
+      +'<div class="info"><span><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><rect x="2" y="2" width="20" height="20" rx="3"/><line x1="6" y1="8" x2="18" y2="8"/><line x1="6" y1="12" x2="14" y2="12"/><line x1="6" y1="16" x2="16" y2="16"/></svg> '+(d.total??0)+'</span>'
+      +'<span>TC '+tcsign+tc.toFixed(2)+'</span>'
+      +'<span><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg> '+pc+'</span>'
+      +'<span><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> '+ts+'</span></div>'
+      
+    +'</div>'
+  }
+  grid.innerHTML=html
+}
+
+function esc(s){const e=document.createElement('span');e.textContent=s;return e.innerHTML}
+// EV service call
+function evHtmlFor(cards, dealer, player){
+  var key=(cards||[]).join(",")+"|"+(dealer||[]).join(",")+"|"+(player||[]).join(",")
+  var evr=evCache[key]
+  if(!evr) return '<span class="pp-ev-cell">-</span>'
+  var dmap={hit:'H',stand:'S',double:'D',cashout:'SR',split:'P'}
+  var bCls=evr.best.decision.toLowerCase().replace(/ /g,'')
+  var sCls=evr.second?evr.second.decision.toLowerCase().replace(/ /g,''):''
+  var bTxt=(dmap[bCls]||evr.best.decision)+' '+evr.best.ev
+  var sTxt=evr.second?(dmap[sCls]||evr.second.decision)+' '+evr.second.ev:''
+  return '<span class="pp-ev-cell '+bCls+' best">'+bTxt+'</span>'+(sTxt?'<span class="pp-ev-cell '+sCls+' sec">'+sTxt+'</span>' : '<span class="pp-ev-cell sec">-</span>')
+}
+
+async function fetchEv(cards, dealer, player, cashOut, betAmount){
+  const key=cards.join(",")+"|"+dealer.join(",")+"|"+player.join(",")
+  if(evCache[key]) return evCache[key]
+  try{
+    const r=await fetch("/ev",{
+      method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({cards,dealer,player,cashOut,betAmount:betAmount||null})
+    })
+    if(!r.ok) return null
+    const d=await r.json()
+    evCache[key]=d
+    return d
+  }catch(e){return null}
+}
+// Player Panel
+function togglePlayerPanel(nm){
+  const panel = $('#player-panel')
+  curPlayerTable = nm
+  $('#pp-title').textContent = nm
+  renderPlayerPanel(nm)
+}
+
+function renderPlayerPanel(nm){
+  const d = tables[nm]
+  const body = $('#pp-body')
+  if(!d || !d.players || !Object.keys(d.players).length){
+    $('#pp-dealer').innerHTML = ''
+    body.innerHTML='<div class="pp-empty" style="grid-column:1/-1">No player data</div>'
+    return
+  }
+  // Update title with TC
+  const tcv = d.tc ?? 0
+  const tcCls = tcv > 0 ? 'g' : tcv < 0 ? 'b' : 'z'
+  const tcsign = tcv > 0 ? '+' : ''
+  
+  $('#pp-title').innerHTML = nm + '<span style="margin-left:20px;color:var(--text-dim)">'+(d.total ?? 0)+'</span><span class="pp-hand-score '+tcCls+'" style="margin-left:20px">'+tcsign+tcv.toFixed(2)+'</span>'
+  // Dealer
+  const dealer = d.dealer
+  if(dealer && dealer.cards && dealer.cards.length){
+    const dc = dealer.cards.map(c =>
+      '<span class="card-chip'+(c.indexOf('\u2665')>=0||c.indexOf('\u2666')>=0?' r':'')+'">'+esc(c)+'</span>'
+    ).join('')
+    const sc = parseInt(dealer.score)
+    const scCls = isNaN(sc) ? 'z' : (sc > 21 ? 'b' : (sc === 21 ? 'g' : 'z'))
+    var dealerUp = dealer.cards[0]||''
+    var isAce = dealerUp.indexOf('A')>=0||dealerUp.indexOf('1')>=0
+    $('#pp-dealer').innerHTML = '<span style="color:var(--text-dim);font-size:12px">Dealer </span>' + dc + '<span class="dscore '+scCls+'">&nbsp;'+esc(dealer.score)+'</span>'+(isAce?' <span class="pp-ins" id="ins-'+nm+'" style="font-size:10px;color:var(--yellow);margin-left:4px">Ins...</span>':'')
+  } else {
+    $('#pp-dealer').innerHTML = ''
+  }
+  const seats = {}
+  const nmap = d.player_names || {}
+  for(const [key, p] of Object.entries(d.players)){
+    const parts = key.split('_')
+    const seatNum = parts[0]
+    const handIdx = parts.length > 1 ? (parseInt(parts[1].replace('h','')) || 0) : 0
+    if(!seats[seatNum]) seats[seatNum] = []
+    seats[seatNum].push({hand: handIdx, cards: p.cards || [], score: p.score || '?', cashOut: p.cashOut, bet: p.bet})
+  }
+  let html = ''
+  for(let si = 1; si <= 7; si++){
+    const s = String(si)
+    if(seats[s]){
+      const hands = seats[s]
+      const playerName = nmap[s] || ''
+      var _isMatch=!followedPlayer||(playerName&&playerName.includes(followedPlayer))
+      const cardHtml = (cards) => cards.map(c =>
+        '<span class="card-chip'+(c.indexOf('\u2665')>=0||c.indexOf('\u2666')>=0?' r':'')+'">'+esc(c)+'</span>'
+      ).join('')
+      html += '<div class="pp-col' + (_isMatch?' tracked':'') + '">'
+      // Find cashout from first hand that has it
+      var _co=null
+      for(var _ci=0;_ci<hands.length;_ci++){if(hands[_ci].cashOut!==undefined){_co=hands[_ci].cashOut;break}}
+      html += '<div class="pp-top"><span class="pp-seat">Seat '+s+'</span>'
+      if(playerName) html += '<span class="pp-pname">'+esc(playerName)+'</span>'
+      html += '<span style="flex:1"></span>'
+      if(_co!==null) html += '<span style="color:var(--yellow);font-size:10px">$'+_co+'</span>'
+      
+      html += '</div>'
+      hands.sort((a,b) => a.hand - b.hand)
+      for(const h of hands){
+        html += '<div class="pp-hand">'
+        html += '<div class="pp-hand-cards">'
+        if(h.cards.length){
+          html += cardHtml(h.cards)
+        }
+        const sc = parseInt(h.score)
+        const scCls = isNaN(sc) ? 'z' : (sc > 21 ? 'b' : (sc === 21 ? 'g' : 'z'))
+        html += '<span class="pp-hand-score '+scCls+'">'+esc(h.score)+'</span>'
+
+        html += '</div>'
+        // Show EV result if cashOut exists and player is tracked
+        html += '<div class="pp-ev-wrap" id="ev-'+nm+'-'+s+'-'+h.hand+'">'+evHtmlFor(d.cards||[],(d.dealer&&d.dealer.cards)||[],h.cards||[])+'</div>'
+        html += '</div>'
+      }
+      html += '</div>'
+    } else {
+      html += '<div class="pp-col"><div class="pp-empty">-</div></div>'
+    }
+  }
+  body.innerHTML = html
+  // Auto-fetch insurance EV if dealer shows A
+  if(d && d.dealer && d.dealer.cards && d.dealer.cards.length){
+    var _up=d.dealer.cards[0]||''
+    if(_up.indexOf('A')>=0||_up.indexOf('1')>=0){
+      var insEl=document.getElementById('ins-'+nm)
+      if(insEl&&!insEl.dataset.fetching){
+        insEl.dataset.fetching='1'
+        fetchEv(d.cards||[], d.dealer.cards||[], [], null).then(function(evr){
+          var el=document.getElementById('ins-'+nm)
+          if(!el) return
+          if(!evr||!evr.insurance_ev){el.textContent='';return}
+          el.textContent='Ins '+evr.insurance_ev
+        })
+      }
+    }
+  }
+  // Auto-fetch EV for tracked players with cashOut
+  if(!d || !followedPlayer) return
+  for(const seatNum in seats){
+    const pname=(d.player_names||{})[seatNum]||''
+    if(!pname.includes(followedPlayer)) continue
+    for(const h of seats[seatNum]){
+      if(h.cashOut===undefined || h.cashOut===null) continue
+      const elId='ev-'+nm+'-'+seatNum+'-'+h.hand
+      const el=document.getElementById(elId)
+      if(!el||el.dataset.fetching==='1') continue
+      el.dataset.fetching='1'
+      fetchEv(d.cards||[], (d.dealer&&d.dealer.cards)||[], h.cards||[], h.cashOut, followedBet).then(function(evr){
+        var target=document.getElementById(elId)
+        if(!target) return
+        if(!evr){target.innerHTML='<span class="pp-ev-cell" style="font-size:10px">err</span>';return}
+        var dmap={hit:'H',stand:'S',double:'D',cashout:'SR',split:'P'}
+        var bCls=evr.best.decision.toLowerCase().replace(/ /g,'')
+        var sCls=evr.second?evr.second.decision.toLowerCase().replace(/ /g,''):''
+        var bTxt=(dmap[bCls]||evr.best.decision)+' '+evr.best.ev
+        var sTxt=evr.second?(dmap[sCls]||evr.second.decision)+' '+evr.second.ev:''
+        target.innerHTML='<span class="pp-ev-cell '+bCls+' best">'+bTxt+'</span>'+(sTxt?'<span class="pp-ev-cell '+sCls+' sec">'+sTxt+'</span>' : '<span class="pp-ev-cell sec">-</span>')
+      })
+    }
+  }
+}
+
+// Handle update to refresh panel
+function handleUpdateTable(p){
+  tables[p.table] = {
+    name: p.table, tc: p.tc, total: p.total,
+    dealer: p.dealer, players: p.players,
+    player_names: p.player_names, time: p.timestamp
+  }
+  render()
+  if(curPlayerTable && curPlayerTable===p.table) renderPlayerPanel(p.table)
+}
+
+// Close panel handlers
+
+// Sort toggle
+document.querySelector('.header-stat').addEventListener('click',()=>{
+  sortMode = (sortMode === 'tc_desc') ? 'name' : 'tc_desc'
+  const svg = document.querySelector('.header-stat svg')
+  if(sortMode==='name'){
+    svg.innerHTML = '<line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>'
+  } else {
+    svg.innerHTML = '<rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>'
+  }
+  render()
+})
+connect()
+var label = followedPlayer || 'Player'
+if(followedBet) label += '<br>'+followedBet
+$('#user-label').innerHTML = label
+if(followedPlayer){$('#user-btn').classList.add('tracking')}
+function showTrackModal(){
+  var modal = document.getElementById('track-modal')
+  var nameInput = document.getElementById('modal-name')
+  var betInput = document.getElementById('modal-bet')
+  nameInput.value = followedPlayer
+  betInput.value = followedBet || '10000000'
+  modal.style.display = 'flex'
+  nameInput.focus()
+  function close(){
+    modal.style.display = 'none'
+    document.getElementById('modal-cancel').removeEventListener('click',close)
+    document.getElementById('modal-confirm').removeEventListener('click',confirm)
+  }
+  function confirm(){
+    var n = nameInput.value.trim()
+    var b = betInput.value.trim()
+    if(!n && !b){close();return}
+    followedPlayer = n
+    followedBet = b
+    localStorage.setItem('ppFollowedPlayer', followedPlayer)
+    localStorage.setItem('ppFollowedBet', followedBet)
+    var label = followedPlayer || 'Player'
+    if(followedBet) label += '<br>'+followedBet
+    $('#user-label').innerHTML = label
+    $('#user-btn').classList.toggle('tracking', !!followedPlayer)
+    close()
+    if(followedPlayer){
+      for(var tname in tables){
+        var pnames = tables[tname].player_names || {}
+        if(Object.values(pnames).some(function(v){return v.includes(followedPlayer)})){
+          togglePlayerPanel(tname)
+          break
+        }
+      }
+    }
+  }
+  document.getElementById('modal-cancel').addEventListener('click',close)
+  document.getElementById('modal-confirm').addEventListener('click',confirm)
+}
+$('#user-btn').addEventListener('click',showTrackModal)
+
+function setRestartLabel(label){
+  const el=$('#restart-label')
+  if(el) el.textContent=label
+  const btn=$('#restart-btn')
+  if(btn) btn.disabled=(label!=='Reboot')
+}
+async function restartMain(){
+  const pwd=prompt('Enter refresh password: PragmaticPlay')
+  if(pwd===null||pwd==='') return
+  try{
+    const r=await fetch('/restart',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({password:pwd})
+    })
+    const d=await r.json()
+    if(!r.ok){alert(d.error||'Refresh failed');return}
+    setRestartLabel('Rebooting...')
+    pollRestartStatus()
+  }catch(_){alert('Request failed, check network')}
+}
+function pollRestartStatus(){
+  fetch('/restart_status').then(r=>r.json()).then(d=>{
+    if(d.restarting){setRestartLabel('Rebooting...');setTimeout(pollRestartStatus,3000)}
+    else setRestartLabel('Reboot')
+  }).catch(()=>setRestartLabel('Reboot'))
+}
+$('#restart-btn').addEventListener('click',restartMain)
+</script>
+<div id="track-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);z-index:999;align-items:center;justify-content:center">
+  <div style="background:var(--bg-card);border-radius:8px;padding:20px;width:320px">
+    <div style="font-size:15px;font-weight:600;margin-bottom:14px">Track Player</div>
+    <label style="font-size:11px;color:var(--text-dim);display:block;margin-bottom:4px">Player name</label>
+    <input type="text" id="modal-name" style="width:100%;padding:6px 10px;margin-bottom:12px" placeholder="Enter player name">
+    <label style="font-size:11px;color:var(--text-dim);display:block;margin-bottom:4px">Bet amount</label>
+    <input type="text" id="modal-bet" style="width:100%;padding:6px 10px;margin-bottom:16px" placeholder="Enter bet amount">
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn" id="modal-cancel">Cancel</button>
+      <button class="btn" id="modal-confirm" style="background:var(--accent);color:#fff;border-color:var(--accent)">Confirm</button>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>"""
+
+routes = web.RouteTableDef()
+
+@routes.get("/")
+async def index(request):
+    return web.Response(text=HTML, content_type="text/html")
+
+@routes.post("/ev")
+async def ev_handler(request):
+    try:
+        data = await request.json()
+        cards = data.get("cards", [])
+        dealer = data.get("dealer", [])
+        player = data.get("player", [])
+        cash_out = data.get("cashOut")
+        bet_amount = data.get("betAmount")
+        if not player:
+            # 仅计算保险 EV
+            result = calc_ev(cards, dealer, [], cash_out, bet_amount)
+            result = {"insurance_ev": result.get("insurance_ev")}
+        else:
+            result = calc_ev(cards, dealer, player, cash_out, bet_amount)
+        return web.json_response(result)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+@routes.post("/restart")
+async def restart_handler(request):
+    global _last_restart_at
+    if restart_chain_running():
+        return web.json_response({"error": "Refresh already in progress"}, status=409)
+    remaining = restart_seconds_left()
+    if remaining > 0:
+        return web.json_response(
+            {"error": f"Too many requests, try again in {remaining}s"}, status=429
+        )
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid request"}, status=400)
+    if not isinstance(data, dict) or data.get("password") != restart_password():
+        return web.json_response({"error": "Wrong password"}, status=401)
+
+    _last_restart_at = time.time()
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+    else:
+        kwargs["start_new_session"] = True
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    with (BASE_DIR / "restart_chain.log").open("a", encoding="utf-8") as log_fd:
+        subprocess.Popen(
+            [sys.executable, str(BASE_DIR / "restart_chain.py")],
+            cwd=str(BASE_DIR),
+            stdout=log_fd,
+            stderr=subprocess.STDOUT,
+            env=env,
+            **kwargs,
+        )
+    return web.json_response({"ok": True, "message": "Restart started"})
+
+@routes.get("/restart_status")
+async def restart_status(request):
+    last = None
+    if _last_restart_at:
+        last = datetime.fromtimestamp(_last_restart_at).strftime("%Y-%m-%d %H:%M:%S")
+    return web.json_response({
+        "restarting": restart_chain_running(),
+        "cooldown_remaining": restart_seconds_left(),
+        "last_restart": last,
+    })
+
+@routes.get("/ws")
+async def ws_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    # Send current MQTT status immediately so badge shows right color
+    from json import dumps as _jdumps
+    await ws.send_str(_jdumps({
+        "type": "status",
+        "payload": {
+            "mqtt": "connected" if state.connected else "disconnected",
+            "reconnects": state.reconnects,
+            "total_msgs": state.total_msgs,
+            "last_msg": state.last_msg_time,
+        }
+    }))
+    await broadcast.add(ws)
+    try:
+        async for _ in ws:
+            pass
+    except:
+        pass
+    finally:
+        await broadcast.remove(ws)
+    return ws
+
+@routes.get("/status")
+async def status(request):
+    return web.json_response({
+        "mqtt": "connected" if state.connected else "disconnected",
+        "clients": broadcast.count,
+        "total_msgs": state.total_msgs,
+        "last_msg": state.last_msg_time,
+        "reconnects": state.reconnects,
+        "last_disconnect_reason": state.last_disconnect_reason,
+    })
+
+async def main():
+    global main_loop
+    main_loop = asyncio.get_running_loop()
+    print("=" * 38)
+    print("  Pragmatic Play Blackjack (独立版)")
+    print("=" * 38)
+    app = web.Application()
+    app.add_routes(routes)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", HTTP_PORT)
+    await site.start()
+    print(f"  [🌐] http://127.0.0.1:{HTTP_PORT}")
+    print(f"  [📡] MQTT {MQTT_HOST}:{MQTT_PORT} (keepalive={MQTT_KEEPALIVE}s)")
+    print("=" * 38)
+    start_mqtt()
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[👋] 已关闭")
