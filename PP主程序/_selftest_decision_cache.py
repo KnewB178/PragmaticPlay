@@ -38,14 +38,6 @@ def on_frame(table, ps_data):
         do = hv.get("decisionOffer")
         if isinstance(do, dict) and do.get("cashOut") is not None:
             dc.setdefault(f"{mapped}_{hk}", {})["cashOut"] = do["cashOut"]
-    for hk, hv in ps_data.items():
-        if not (hk.startswith("h") and isinstance(hv, dict)):
-            continue
-        if hv.get("currentDecision"):
-            st = dc.get(f"{mapped}_{hk}")
-            if isinstance(st, dict):
-                st.pop("canDecide", None)
-                st.pop("cashOut", None)
     if turn:
         for k, st in dc.items():
             if k not in turn:
@@ -101,26 +93,4 @@ on_frame("T", {"seatNumber": -1, "gameId": "G2",
 print("   庄家帧(无offer):", lit(), " 期望 ['1_h0']（不误灭）")
 assert lit() == ["1_h0"]
 
-# 7) ★ 我提交了决策（currentDecision 有值）→ 提示必须立刻消失，不等别人
-decision_cache["T"] = {}
-on_frame("T", {"seatNumber": 0, "gameId": "G3",
-               "h0": {"score": "13", "cards": C("05", "08"), "decisionOffer": {"cashOut": 13.0}}})
-print("7a) 轮到我:", lit(), " 期望 ['1_h0']")
-assert lit() == ["1_h0"]
-
-on_frame("T", {"seatNumber": 0, "gameId": "G3",
-               "h0": {"score": "13", "cards": C("05", "08"), "currentDecision": "HIT"}})
-print("7b) 我按了 HIT(无offer):", lit(), " 期望 [] ← 提交即灭")
-assert lit() == [], "★ 玩家一提交决策，提示必须立刻消失"
-
-on_frame("T", {"seatNumber": 0, "gameId": "G3",
-               "h0": {"score": "13", "cards": C("05", "08", "02"), "currentDecision": "HIT"}})
-print("7c) 补牌后仍带 currentDecision:", lit(), " 期望 []（不乱亮）")
-assert lit() == []
-
-on_frame("T", {"seatNumber": 0, "gameId": "G3",
-               "h0": {"score": "15", "cards": C("05", "08", "02"), "decisionOffer": {}}})
-print("7d) 再次轮到我(新offer):", lit(), " 期望 ['1_h0']")
-assert lit() == ["1_h0"], "收到下一条可决策要重新亮"
-
-print("\n✅ 单座位：做完立刻灭；提交决策立刻灭；再轮到时重新亮；不会被无 offer 的帧误灭")
+print("\n✅ 单座位：做完立刻灭，且不会被无 offer 的帧误灭")

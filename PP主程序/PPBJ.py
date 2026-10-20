@@ -578,20 +578,7 @@ async def listen_ws(table_name, url, row, retry=0):
                                 if isinstance(do, dict) and do.get("cashOut") is not None:
                                     st = _dc.setdefault(f"{mapped_seat}_{hk}", {})
                                     st["cashOut"] = do["cashOut"]
-                            # 3) 这一手已经有 currentDecision（玩家已提交动作）→ 立刻熄灭。
-                            #    必须在「点亮」之后判断：同一帧里既可能带 offer、也可能已带动作。
-                            #    ★ 关键：前面「点亮」是按 turn（带 decisionOffer 的手）做的，
-                            #      而服务器提交后的帧经常仍带 offer + currentDecision 一起推，
-                            #      所以熄灭必须按「本帧所有带 currentDecision 的手」，不能只看 turn。
-                            for hk, hv in ps_data.items():
-                                if not (hk.startswith("h") and isinstance(hv, dict)):
-                                    continue
-                                if hv.get("currentDecision"):
-                                    st = _dc.get(f"{mapped_seat}_{hk}")
-                                    if isinstance(st, dict):
-                                        st.pop("canDecide", None)
-                                        st.pop("cashOut", None)
-                            # 4) 除了本帧轮到的手，其余亮着的全部熄灭（回合已经过去了）
+                            # 3) 除了本帧轮到的手，其余亮着的全部熄灭（回合已经过去了）
                             if turn:
                                 for k, st in _dc.items():
                                     if k not in turn:

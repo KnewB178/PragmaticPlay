@@ -1,8 +1,0 @@
-[build] 构建环境 = C:\Users\alien\.workbuddy\binaries\python\envs\ppbuild\Scripts\python.exe
-[build] 删除旧产物 PP_AutoBot.exe
-[build] PyInstaller 打包中 ...
-247 INFO: PyInstaller: 6.22.3, contrib hooks: 2026.8
-248 INFO: Python: 3.13.14
-271 INFO: Platform: Windows-11-10.0.26300-SP0
-271 INFO: Python environment: C:\Users\alien\.workbuddy\binaries\python\envs\ppbuild
-273 INFO: wrote D:\MyProject\Pragmatic Play Blackjack\AutoBot\build\PP_AutoBot.spec

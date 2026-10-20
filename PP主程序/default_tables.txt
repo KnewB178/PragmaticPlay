@@ -1,6 +1,0 @@
-sobj212blackjack
-sobj213blackjack
-sobj277blackjack
-sobj278blackjack
-sobj2710blackjac
-sobj2711blackjac
