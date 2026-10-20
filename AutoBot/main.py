@@ -12,10 +12,10 @@ PP 自动程序（Python 版 · 新建文件夹，不修改原文件夹任何文
      掷骰选桌（≥7 正数池 / <7 负数池 / 只收有空位的桌 / 池空等 5 秒重掷）代码保留，开关设 False 即恢复
   5. tableId → tableConfig API → 构建 wss URL（顺带取该桌最低注额）
   6. 连接后静默收帧（不打印原始帧）；固定板面显示：桌名/座位/牌靴已出牌/TC/各家点数/EV/动作
-  7. 找空位坐下 → 开局(betsopen)后随机 3–5 秒押主注（金额 = 该桌最低限额）
+  7. 找空位坐下 → 开局(betsopen)后随机 3–8 秒押主注（金额 = 该桌最低限额）
   8. 接管 TC 自算（betsopen 时导入 feed 完整已出牌作基线；voip_cc 换鞋清空）
   9. 轮到我（decisionOffer + activeHand）→ 把手牌 / 庄家明牌 / 全 shoe 已出牌交给
-     PP EV.py 算最优动作 → 随机 3–5 秒后提交 hit / stand / double / split / cashOut
+     PP EV.py 算最优动作 → 随机 3–8 秒后提交 hit / stand / double / split / cashOut
  10. 庄家明牌 A：收到保险邀请(notinsured) → 按保险 EV(3p-1) 自动买 / 不买并回执
  11. 拉黑只在「下注被拒」时发生：placebetError / betValidationError / 下了注整局没收到牌
      满桌（没空位）/ 久坐被踢 / 断线 → 只断开回去重掷，不拉黑（下一轮还可能再抽到）
@@ -306,11 +306,11 @@ POOL_EMPTY_WAIT = 5      # 候选池为空时等待秒数后重掷
 HEARTBEAT_INTERVAL = 10  # 心跳间隔秒数
 RECONNECT_WAIT = 2       # 断开后重掷前等待秒数
 BET_DELAY_MIN = 3        # 开局后随机延时下限（秒）再提交主注
-BET_DELAY_MAX = 5        # 开局后随机延时上限（秒）
+BET_DELAY_MAX = 8        # 开局后随机延时上限（秒）
 FALLBACK_BET = 10        # 查不到该桌最低限额时的兜底注额
 
 ACTION_DELAY_MIN = 3     # 轮到我后随机延时下限（秒）再提交动作
-ACTION_DELAY_MAX = 5     # 轮到我后随机延时上限（秒）
+ACTION_DELAY_MAX = 8     # 轮到我后随机延时上限（秒）
 DECISION_WINDOW = 12     # 回合窗口保护：从收到 decisionOffer 起超过这个秒数就不再提交
 USE_CASHOUT = True       # 允许「提前兑现」参与自动决策（原样交 PP EV.py 按它的公式排；False = 不兑现）
 
@@ -1661,7 +1661,7 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     Fore.MAGENTA)
 
         async def place_bet_later(gid):
-            """开局后随机 3-5 秒，用【一条 lpbet】把我方所有座位一次押出去。
+            """开局后随机 3-8 秒，用【一条 lpbet】把我方所有座位一次押出去。
 
             ★ 为什么不是每个座位各发一条：
               一个账号在一局里只有一个「注位」，再发一条 lpbet 会被服务器当成
@@ -1680,8 +1680,8 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                 now = time.monotonic()
                 if bet["last_gid"] != gid:
                     if bet["sent_gid"] != gid:
-                        log(f"  [⚠️] Bet skipped — game {gid} already replaced by "
-                            f"{bet['last_gid']} before we could send", Fore.YELLOW)
+                        log("  [⚠️] Bet skipped — round already moved on before we could send",
+                            Fore.YELLOW)
                     return
                 if bet["sent_seats_gid"] != gid:
                     bet["sent_seats_gid"] = gid
@@ -1745,8 +1745,9 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                 UI["action"] = (f"Main bet {amt} × {len(seats)} seat(s) "
                                 f"— awaiting confirm…")
                 log(f"  [💵] Main bet {amt} sent at {now - t0:.1f}s on {len(seats)} "
-                    f"seat(s) {seat_disp(seats)} in one command "
-                    f"(game {gid}) — awaiting confirm", Fore.YELLOW)
+                    f"seat(s) {seat_disp(seats)}"
+                    f"{' in one command' if len(seats) > 1 else ''} — awaiting confirm",
+                    Fore.YELLOW)
                 return
 
         def schedule_decision(ps: dict, seat: str):
@@ -1778,7 +1779,7 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     act_later(gid, seat, hkey[1:], hand, offer))
 
         async def act_later(gid, seat, hand_idx, hand, offer):
-            """轮到我 → 延时 3-5 秒 → EV 程序算最优动作 → 提交"""
+            """轮到我 → 延时 3-8 秒 → EV 程序算最优动作 → 提交"""
             t0 = time.monotonic()
             delay = random.uniform(ACTION_DELAY_MIN, ACTION_DELAY_MAX)
             await asyncio.sleep(delay)
@@ -1810,7 +1811,7 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
             evtxt = " | ".join(f'{x["decision"]} {x["ev"]:+.4f}' for x in ordered)
             UI["ev"] = evtxt
             UI["action"] = f"{dec} sent (seat {seat_disp(seat)}, delay {delay:.1f}s)"
-            log(f"  [▶️] Action {dec} sent (game {gid} seat {seat_disp(seat)} "
+            log(f"  [▶️] Action {dec} sent (seat {seat_disp(seat)} "
                 f"hand {hand_disp(hand_idx)}) delay {delay:.1f}s", Fore.CYAN)
 
         async def send_insurance(gid):
@@ -1872,13 +1873,12 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     endg = str((d.get("bjGameEnd") or {}).get("id"))
                     # 诊断：这一局我们一注都没发出去 → 明确喊出来，别让它静默过去
                     if endg and str(bet["sent_gid"]) != endg:
-                        log(f"  [❌] Game {endg} ended with NO bet sent "
-                            f"(seats={seat_disp(my_seat['v'])} uid={my_uid['v']} "
-                            f"last_gid={bet['last_gid']})", Fore.RED)
+                        log(f"  [❌] Round ended with NO bet sent "
+                            f"(seats={seat_disp(my_seat['v'])} uid={my_uid['v']})", Fore.RED)
                     # 诊断：发了几个位、实际几个位拿到牌 —— 多座位下注是否真的成功，看这一行
                     if bet["sent_gid"] == endg or bet["carded"]:
                         miss = [s for s in my_seat["v"] if s not in bet["sent_seats"]]
-                        log(f"  [📊] Game {endg}: bet sent on "
+                        log(f"  [📊] Bet sent on "
                             f"{len(bet['sent_seats'])} seat(s) {seat_disp(sorted(bet['sent_seats']))}"
                             f" → cards on {len(bet['carded'])} seat(s) "
                             f"{seat_disp(sorted(bet['carded']))}"
@@ -1889,7 +1889,7 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     # 一注都没确认过（ok_gid 也不是这一局）才算整桌被拒；部分确认只提示
                     if endg in pg and str(bet["ok_gid"]) not in pg:
                         BLACKLIST.add(name)
-                        log(f"  [⛔] Round ended (game {endg}) with no cards on our seat(s) "
+                        log(f"  [⛔] Round ended with no cards on our seat(s) "
                             f"— blacklisting table, re-rolling", Fore.RED)
                         return "round ended with no bet confirmation"
                     bet["carded"].clear()
@@ -1919,7 +1919,7 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     pg = {str(v) for v in bet["pending"].values()}
                     if bet["pending"] and gid and gid not in pg and str(bet["ok_gid"]) not in pg:
                         BLACKLIST.add(name)
-                        log(f"  [⛔] Previous bet (game {sorted(pg)}) never confirmed — "
+                        log("  [⛔] Previous bet never confirmed — "
                             f"treated as rejected, blacklisting table", Fore.RED)
                         return "previous bet not confirmed"
                     bet["pending"].clear()     # 上一局的待确认表不带到本局
@@ -1977,8 +1977,8 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     # ── 每局按「上一局结算完的 PDEV」调整座位数（只在进入新的一局时做）──
                     #    正 → 最多 MAX_SEATS_PER_TABLE 个位；非正 → 1 个位（能坐几个算几个）
                     if gid and gid != bet["last_gid"]:
-                        await adjust_seats(f"game {gid}")
-                    # 已坐下且本局还没真正押出去 → 随机延时 3-5 秒押主注（只押主注）
+                        await adjust_seats("New round")
+                    # 已坐下且本局还没真正押出去 → 随机延时后押主注（只押主注）
                     # ★ 用 sent_gid（真发出才算）而不是 last_gid（只是"本局基准"），
                     #   这样补的位晚一步确认也不会让整局变成一注都没发
                     if gid and my_uid["v"] is not None and gid != bet["sent_gid"]:
@@ -2001,7 +2001,7 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     ni = d.get("notinsured") or {}
                     gid = bet["last_gid"]
                     log(f"  [🛡️] Insurance offer (seat {seat_disp(ni.get('seat'))} "
-                        f"auto={ni.get('auto')}) game {gid}", Fore.CYAN)
+                        f"auto={ni.get('auto')})", Fore.CYAN)
                     if (gid and my_uid["v"] is not None and my_seat["v"]
                             and bet["amount"] and ins["done"] != gid):
                         ins["done"] = gid
@@ -2045,8 +2045,8 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                         bet["pending"].pop(str(seat_no), None)
                         bet["ok_gid"] = cgid
                         bet["carded"].add(str(seat_no))
-                        log(f"  [✅] Bet confirmed (game {cgid} "
-                            f"seat {seat_disp(seat_no)} got cards)", Fore.GREEN)
+                        log(f"  [✅] Bet confirmed — seat {seat_disp(seat_no)} got cards",
+                            Fore.GREEN)
                     # 我们座位：轮到我 → 排动作；并打印动作回执（服务器确认我们这手做了什么）
                     if _mine(seat_no):
                         last_ps[str(seat_no)] = ps
