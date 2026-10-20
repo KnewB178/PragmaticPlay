@@ -540,6 +540,11 @@ async def listen_ws(table_name, url, row, retry=0):
                         # ★ 把这一帧的「决策状态」写进整局累积表（不再每帧重建）：
                         #   canDecide = 服务器邀请这一手决策（有 decisionOffer）
                         #   cashOut   = 该手可提前兑现的金额（可能没有）
+                        #   熄灭规则：只看「这一手自己这一帧」——
+                        #     有 decisionOffer（或还有 decisionTimer）→ 轮到他 → 亮
+                        #     两个都没有 → 他已经做完 → 灭
+                        #   绝不用「别人开始决策」当熄灭信号：PP 是顺序轮流，
+                        #   我坐 1 号和 7 号位，1 号做完才灭 1 号，7 号要等轮到自己才亮。
                         raw_seat = ps_data.get("seatNumber")
                         if raw_seat is not None:
                             mapped_seat = "0" if raw_seat == -1 else str(raw_seat + 1)
@@ -553,12 +558,12 @@ async def listen_ws(table_name, url, row, retry=0):
                                 if not has_offer and not hv.get("cards"):
                                     continue          # 空手牌不记
                                 st = _dc.setdefault(flat_key, {})
-                                if has_offer:
+                                if has_offer or "decisionTimer" in hv:
                                     st["canDecide"] = True
-                                    if do.get("cashOut") is not None:
+                                    if has_offer and do.get("cashOut") is not None:
                                         st["cashOut"] = do["cashOut"]
-                                elif hv.get("activeHand") is False and not hv.get("decisionTimer"):
-                                    # 服务器明确说这一手不再轮到他 → 撤掉决策标记
+                                else:
+                                    # 这一手这一帧既无决策邀请、也无决策计时 → 已做完
                                     st.pop("canDecide", None)
                                     st.pop("cashOut", None)
                             decisions = _dc

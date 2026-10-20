@@ -603,19 +603,32 @@ function renderPlayerPanel(nm){
   if(!d || !followedPlayer) return
   for(const seatNum in seats){
     const pname=(d.player_names||{})[seatNum]||''
-    if(!pname.includes(followedPlayer)) continue
+    const _mine = pname.includes(followedPlayer)
     for(const h of seats[seatNum]){
       // ★ 触发条件：服务器邀请决策(canDecide) 或 有 cashOut
       //   旧逻辑只认 cashOut → 没有兑现报价时这一手永远不算 EV
       const _hasCo=(h.cashOut!==undefined && h.cashOut!==null)
-      if(!h.canDecide && !_hasCo) continue
-      if(!h.cards || !h.cards.length) continue
+      const _live=!!h.canDecide || _hasCo
       const elId='ev-'+nm+'-'+seatNum+'-'+h.hand
       const el=document.getElementById(elId)
-      if(!el||el.dataset.fetching==='1') continue
+      if(!_mine) continue
+      if(!_live){
+        // ★ 这一手已经做完（canDecide 撤了）→ 清掉显示，不留上一手的旧 EV
+        if(el){ el.innerHTML=''; el.dataset.fetching='0'; delete el.dataset.shown }
+        continue
+      }
+      if(!h.cards || !h.cards.length) continue
+      if(!el) continue
+      // ★ 同一手同样的输入只算一次；牌变了/兑现价变了才重算
+      const _sig=(h.cards||[]).join(',')+'|'+(d.dealer&&d.dealer.cards?d.dealer.cards.join(','):'')
+                 +'|co='+(_hasCo?h.cashOut:'-')
+      if(el.dataset.shown===_sig) continue
+      if(el.dataset.fetching==='1') continue
       el.dataset.fetching='1'
+      el.dataset.shown=_sig
       fetchEv(d.cards||[], (d.dealer&&d.dealer.cards)||[], h.cards||[], _hasCo?h.cashOut:null, followedBet).then(function(evr){
         var target=document.getElementById(elId)
+        if(target) target.dataset.fetching='0'
         if(!target) return
         if(!evr){target.innerHTML='<span class="pp-ev-cell" style="font-size:10px">err</span>';return}
         var dmap={hit:'H',stand:'S',double:'D',cashout:'SR',split:'P'}
