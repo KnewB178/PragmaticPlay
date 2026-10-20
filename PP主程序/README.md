@@ -241,11 +241,18 @@ const _hasCo = (h.cashOut !== undefined && h.cashOut !== null)
 if (!h.canDecide && !_hasCo) continue    // 两者都没有才跳过
 ```
 
-`canDecide` 由 `PPBJ.py` 判定：
+`canDecide` 由 `PPBJ.py` 判定，**只看这一手自己这一帧**：
 
-- 服务器给了 `decisionOffer` → `canDecide = true`
-- 这一手打完（`activeHand=false` 且无 `decisionTimer`）→ 撤掉标记
+- 有 `decisionOffer` 或还有 `decisionTimer` → `canDecide = true`（轮到他）
+- 两者都没有 → 这一手做完了 → **撤掉标记、熄灭**
 - **新一局（`betsopen`）→ 整个缓存清空**，防止上一局的 cashOut 串到本局
+
+> ⚠️ **绝不能用「别人开始决策」当作熄灭信号。** PP 是**顺序轮流**的：
+> 你同时坐 1 号和 7 号位时，1 号做完只灭 1 号；中间 2~6 号是别人的回合，
+> 与你无关；7 号要等真正轮到自己才亮。
+
+> ⚠️ **不要用 `activeHand is False` 判断结束。** 服务器大多数帧根本不带 `activeHand`
+> （值是 `None`），这个条件永远不成立，会导致做完以后 EV 一直亮着。
 
 ### 决策缓存 `decision_cache`
 
