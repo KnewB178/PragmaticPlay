@@ -578,10 +578,17 @@ async def listen_ws(table_name, url, row, retry=0):
                                 if isinstance(do, dict) and do.get("cashOut") is not None:
                                     st = _dc.setdefault(f"{mapped_seat}_{hk}", {})
                                     st["cashOut"] = do["cashOut"]
-                            # 3) 除了本帧轮到的手，其余亮着的全部熄灭（回合已经过去了）
+                            # 3) 熄灭：只灭「本帧这个座位」里的手，不动别的座位。
+                            #    ★ 关键：同一玩家可以坐多个座位（如 1/4/5 号），
+                            #      服务器是逐个推送的 —— s5 轮到、s4 轮到、s6 轮到……
+                            #      旧逻辑「一有人轮到就把所有亮着手全灭」会导致
+                            #      s4 开始 → s5 被灭，s6 开始 → s4 被灭 …… 永远只剩一个亮。
+                            #      每个座位的帧只该管自己这个座位。
                             if turn:
                                 for k, st in _dc.items():
-                                    if k not in turn:
+                                    if k in turn:
+                                        continue
+                                    if k.split("_")[0] == mapped_seat:
                                         st.pop("canDecide", None)
                                         st.pop("cashOut", None)
                             decisions = _dc
