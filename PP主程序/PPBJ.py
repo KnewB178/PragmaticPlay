@@ -259,6 +259,25 @@ def clear_decision_cache(table_name):
     decision_cache[table_name] = {}
 
 
+def _now_turn(ps_data):
+    """本帧「轮到谁做决策」→ 返回 {"座位_h0", …}
+
+    PP 是顺序轮流：带 decisionOffer 的那一手就是现在轮到的手。
+    没有 offer 的帧返回空集合（不改变现状，不清也不点）。
+    """
+    raw_seat = ps_data.get("seatNumber")
+    if raw_seat is None:
+        return set()
+    mapped = "0" if raw_seat == -1 else str(raw_seat + 1)
+    out = set()
+    for hk, hv in ps_data.items():
+        if not (hk.startswith("h") and isinstance(hv, dict)):
+            continue
+        if isinstance(hv.get("decisionOffer"), dict):
+            out.add(f"{mapped}_{hk}")
+    return out
+
+
 def publish_pp_update(table_name, tc_val, cards, decisions=None):
     if mqtt_client is None:
         return
@@ -537,35 +556,34 @@ async def listen_ws(table_name, url, row, retry=0):
                                     }
                                     topic = f"pp/decision/{table_name}"
                                     mqtt_client.publish(topic, json.dumps(payload), qos=1)
-                        # ★ 把这一帧的「决策状态」写进整局累积表（不再每帧重建）：
-                        #   canDecide = 服务器邀请这一手决策（有 decisionOffer）
-                        #   cashOut   = 该手可提前兑现的金额（可能没有）
-                        #   熄灭规则：只看「这一手自己这一帧」——
-                        #     有 decisionOffer（或还有 decisionTimer）→ 轮到他 → 亮
-                        #     两个都没有 → 他已经做完 → 灭
-                        #   绝不用「别人开始决策」当熄灭信号：PP 是顺序轮流，
-                        #   我坐 1 号和 7 号位，1 号做完才灭 1 号，7 号要等轮到自己才亮。
+                        # ★ 决策状态（单座位就够）：
+                        #   PP 是「顺序轮流」—— 谁收到 decisionOffer，就是轮到谁。
+                        #   所以：这一帧带 offer 的座位 = 现在轮到他；
+                        #         其他所有原本亮着的座位 = 已经做完了 → 立刻熄。
+                        #   不依赖 activeHand（服务器大多帧不带），也不等下一局。
+                        turn = _now_turn(ps_data)      # → 本帧轮到的手集合，如 {"3_h0"}
                         raw_seat = ps_data.get("seatNumber")
                         if raw_seat is not None:
                             mapped_seat = "0" if raw_seat == -1 else str(raw_seat + 1)
                             _dc = decision_cache.setdefault(table_name, {})
+                            # 1) 先按本帧把「轮到的手」点亮
+                            for flat_key in turn:
+                                st = _dc.setdefault(flat_key, {})
+                                st["canDecide"] = True
+                            # 2) 本帧取到的 cashOut 挂上去
                             for hk, hv in ps_data.items():
                                 if not (hk.startswith("h") and isinstance(hv, dict)):
                                     continue
-                                flat_key = f"{mapped_seat}_{hk}"
                                 do = hv.get("decisionOffer")
-                                has_offer = isinstance(do, dict)
-                                if not has_offer and not hv.get("cards"):
-                                    continue          # 空手牌不记
-                                st = _dc.setdefault(flat_key, {})
-                                if has_offer or "decisionTimer" in hv:
-                                    st["canDecide"] = True
-                                    if has_offer and do.get("cashOut") is not None:
-                                        st["cashOut"] = do["cashOut"]
-                                else:
-                                    # 这一手这一帧既无决策邀请、也无决策计时 → 已做完
-                                    st.pop("canDecide", None)
-                                    st.pop("cashOut", None)
+                                if isinstance(do, dict) and do.get("cashOut") is not None:
+                                    st = _dc.setdefault(f"{mapped_seat}_{hk}", {})
+                                    st["cashOut"] = do["cashOut"]
+                            # 3) 除了本帧轮到的手，其余亮着的全部熄灭（回合已经过去了）
+                            if turn:
+                                for k, st in _dc.items():
+                                    if k not in turn:
+                                        st.pop("canDecide", None)
+                                        st.pop("cashOut", None)
                             decisions = _dc
 
                         all_cards = issued_cards.get(table_name, {}).get("all_cards", [])
