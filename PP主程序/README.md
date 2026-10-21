@@ -1,8 +1,10 @@
 # PP 主程序 说明文档
 
 > 目录：`D:/MyProject/Pragmatic Play Blackjack/PP主程序/`
-> 最后更新：2026-10-20（commit `dc7c2c9`）
+> 最后更新：2026-10-21（commit `0b300d9`）
 > 本文档只讲**主程序（网络端）**。自动下注程序 AutoBot 是另一套，两者独立运行、互不依赖。
+>
+> 📕 想知道这个功能踩过哪些坑、为什么这样写 → 看 **`踩坑与修正记录.md`**
 
 ---
 
@@ -232,27 +234,39 @@ HTTP_PORT = 8888
 
 ## 八、EV 触发规则（重要）
 
-**轮到你这一手决策，就出 EV。** 不再要求必须有 CashOut。
-
-前端判断逻辑：
+**轮到你这一手决策，就出 EV。唯一判据是 `canDecide`。**
 
 ```javascript
 const _hasCo = (h.cashOut !== undefined && h.cashOut !== null)
-if (!h.canDecide && !_hasCo) continue    // 两者都没有才跳过
+const _live = !!h.canDecide          // ← 只看这个
 ```
 
-`canDecide` 由 `PPBJ.py` 判定，**只看这一手自己这一帧**：
+`cashOut` 只当**兑现价参数**传给 EV 引擎，**不是**触发条件。
 
-- 有 `decisionOffer` 或还有 `decisionTimer` → `canDecide = true`（轮到他）
-- 两者都没有 → 这一手做完了 → **撤掉标记、熄灭**
-- **新一局（`betsopen`）→ 整个缓存清空**，防止上一局的 cashOut 串到本局
+### `canDecide` 怎么来的（`PPBJ.py`）
 
-> ⚠️ **绝不能用「别人开始决策」当作熄灭信号。** PP 是**顺序轮流**的：
-> 你同时坐 1 号和 7 号位时，1 号做完只灭 1 号；中间 2~6 号是别人的回合，
-> 与你无关；7 号要等真正轮到自己才亮。
+**只跟 `decisionOffer`**，而且**只处理本帧这个座位**：
 
-> ⚠️ **不要用 `activeHand is False` 判断结束。** 服务器大多数帧根本不带 `activeHand`
-> （值是 `None`），这个条件永远不成立，会导致做完以后 EV 一直亮着。
+- 本帧这个座位的手有 `decisionOffer` → `canDecide = true`（+ 记下 `cashOut`）
+- 没有 → 这一手做完了 → **撤掉标记、熄灭**
+- **新一局（`betsopen`）→ 整个缓存清空**，防止上一局的数据串到本局
+
+```python
+do = hv.get("decisionOffer")
+if isinstance(do, dict):
+    st["canDecide"] = True
+    if do.get("cashOut") is not None:
+        st["cashOut"] = do["cashOut"]
+else:
+    st.pop("canDecide", None)
+    st.pop("cashOut", None)
+```
+
+> 服务器上 `decisionTimer`、`currentDecision` 这两个字段**实测根本不存在**（300 帧 0 次）。
+> 别拿它们做判断。详见 `踩坑与修正记录.md`。
+
+> **绝不能用「别人开始决策」当熄灭信号。** 同一玩家可坐多个座位（实测 1&7、3/4/5），
+> 服务器同一帧里可能同时有多个座位 `canDecide`。跨座位熄灭 = 只剩一个亮。
 
 ### 决策缓存 `decision_cache`
 
@@ -260,9 +274,8 @@ if (!h.canDecide && !_hasCo) continue    // 两者都没有才跳过
 decision_cache = {}   # 桌名 → { "1_h0": {"canDecide": True, "cashOut": 12.5}, … }
 ```
 
-**为什么需要它**：PP 服务器一次只推**一个座位**的帧。如果每帧重建决策表，同一份数据里就只有那一个座位，另一手永远没有决策信息 → 网络端那手永远不算 EV。
-
-改成整局累积之后，**每次推送都带着全部座位的决策状态**，不管哪一帧先到、哪一帧后到，两个座位都能算 EV。
+**为什么需要它**：PP 服务器一次只推**一个座位**的帧。每帧重建决策表就只有那一个座位，
+另一手永远没有决策信息。改成整局累积后，每次推送都带全部座位的状态。
 
 ---
 
@@ -315,7 +328,7 @@ const key = cards + "|" + dealer + "|" + player + "|co=" + cashOut + "|bet=" + b
 | 网页开了但没数据 | MQTT 起了吗？`PPBJ.py` 跑了吗？`WS_Config.txt` 的 JSESSIONID 过期没？ |
 | 有牌但 TC 一直是 0 | 桌没接管（`voip_cc` 换鞋信号没到），或 feed 没给基线 |
 | 有牌但 EV 不出 | 那一手有没有 `canDecide`？玩家名匹配上了吗（Track Player 填的名字）？ |
-| 两个座位只出一个 EV | 检查两个文件是不是都更新了、都重启了 |
+| 多个座位只出一个 EV | `PPBJ.py` 里有没有跨座位的熄灭逻辑（见铁律 2） |
 | EV 数字明显不对 | `betAmount` 填对了吗？CashOut 是绝对金额，要除以注额才是 EV |
 
 ---
@@ -325,6 +338,10 @@ const key = cards + "|" + dealer + "|" + player + "|co=" + cashOut + "|bet=" + b
 | 日期 | 改动 |
 |---|---|
 | 2026-10-20 | 决策提示改为「轮到决策即算 EV」，不再只认 CashOut。新增 `decision_cache` 整局累积；前端触发条件改 `canDecide \|\| cashOut`；EV 缓存 key 补 cashOut / betAmount；去掉 250ms 去抖 |
+| 2026-10-21 | **决策提示最终版：只跟 `decisionOffer`**。`PPBJ.py` 熄灭范围限本座位（多座位不再互相灭）；删掉 `currentDecision`、`_handSig` 等所有推断式熄灭逻辑；前端触发条件收敛为单一 `canDecide` |
+
+> 中间几次失败的改法（`activeHand` / `currentDecision` / `_handSig`）为什么错、怎么回退，
+> 全部记在 `踩坑与修正记录.md`。
 
 ---
 
