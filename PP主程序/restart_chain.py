@@ -248,19 +248,18 @@ def main() -> None:
         log("开始刷新 PP 主程序（含 receiver）")
         if not mqtt_available():
             log(f"[WARNING] MQTT broker 未监听 {MQTT_HOST}:{MQTT_PORT}，PPBJ 可能启动失败")
-        stop_receiver()          # 先关 receiver（网页会短暂断开，稍后自动重连）
         stop_ppbj()
-        log(f"等待 {STOP_WAIT} 秒后运行 WSS.py")
+        stop_receiver()          # 关掉现有 receiver
+        log(f"等待 {STOP_WAIT} 秒后重启 receiver / 运行 WSS.py")
         time.sleep(STOP_WAIT)
+        start_receiver()         # 先把 receiver 拉起来（最新代码）
         log("运行 WSS.py（内部会自动执行 Build_WS_URLs.py）...")
         result = subprocess.run([PYTHON, str(WSS_SCRIPT)], cwd=BASE_DIR, env=child_env())
         log(f"WSS.py 结束, 退出码={result.returncode}")
     finally:
         try:
             stop_ppbj()
-            start_receiver()     # 先起 receiver → 网页先恢复
-            time.sleep(2)        # 给 receiver 两秒监听端口/连 MQTT
-            start_ppbj()         # 再起 PPBJ
+            start_ppbj()
         finally:
             release_lock()
 
