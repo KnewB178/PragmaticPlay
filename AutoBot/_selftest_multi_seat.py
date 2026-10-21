@@ -293,12 +293,54 @@ class _Conn:
         return False
 
 
+def startgames(ws):
+    return [s for s in ws.sent if "<startgame" in s]
+
+
+async def run_x_startgame(table_name):
+    """⑫ Blackjack X 坐下确认后必须发 <startgame>；真人荷官桌必须不发。"""
+    ws = FakeWS()
+    main.websockets.connect = lambda *a, **k: _Conn(ws)
+    task = asyncio.create_task(main.listen_table(table_name, "wss://x/y", 10, 10, None))
+    await asyncio.sleep(3.5)          # 首次坐下要等 initial_report 的 3 秒
+    ws.push({"subscribe": {"channel": f"table-{table_name}", "status": "success"}})
+    await asyncio.sleep(0.2)
+    seat = sitdowns(ws)[0]
+    ws.push({"seat": {"num": seat, "event": "sit", "user_id": "ppc1",
+                      "screen_name": "Me"}})
+    await asyncio.sleep(1.2)
+    ws.stop()
+    try:
+        await asyncio.wait_for(task, timeout=5)
+    except (asyncio.TimeoutError, Exception):
+        pass
+    return startgames(ws)
+
+
 if __name__ == "__main__":
     try:
         asyncio.run(run())
         asyncio.run(run_fixed())
         asyncio.run(run_multi_decision())
         asyncio.run(run_bet_ack_trap())
+
+        # ⑫ 只有 Blackjack X 桌发 startgame，真人桌不发
+        x_cmds = asyncio.run(run_x_startgame("BlackjackX 41"))
+        print(f"\n⑫ BlackjackX 41 发 startgame 条数（应 1）: {len(x_cmds)}")
+        assert len(x_cmds) == 1, f"X 桌应发 1 条 startgame，实际 {len(x_cmds)}"
+        c = x_cmds[0]
+        assert "<startgame " in c and "startGame" not in c, f"标签必须全小写: {c}"
+        assert 'gameMode="blackjack_desktop"' in c, f"缺 gameMode: {c}"
+        assert 'seatNum="' in c and 'ck="' in c, f"缺 seatNum/ck: {c}"
+        assert "tableId" not in c and "userId" not in c and "dealNow" not in c, \
+            f"startgame 不应带 tableId/userId/dealNow: {c}"
+        print("   ", c)
+
+        live_cmds = asyncio.run(run_x_startgame("Blackjack 5"))
+        print(f"⑬ 真人桌 Blackjack 5 发 startgame 条数（应 0）: {len(live_cmds)}")
+        assert len(live_cmds) == 0, f"真人桌绝不能发 startgame，实际 {len(live_cmds)}"
+
+        print("\n✅ 全部通过（含 X 桌 startgame）")
     except AssertionError as e:
         print("\n❌", e)
         sys.exit(1)

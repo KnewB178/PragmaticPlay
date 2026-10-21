@@ -2120,6 +2120,13 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                             UI["my_seat"] = list(my_seat["v"])
                             log(f"  [✅] Seat confirmed: {seat_disp(num)} "
                                 f"— {len(my_seat['v'])} seat(s) now", Fore.GREEN)
+                            # ── Blackjack X（电子桌、无荷官）→ 坐下后主动开局 ──
+                            # X 桌没人开局就一直是 "Between games"，不下这条永远等不到
+                            # betsopen。真人荷官桌有荷官推局，绝不能发（只对 X 桌生效）。
+                            if is_blackjack_x(name):
+                                await ws.send(_startgame(ch_holder["ch"], num))
+                                log(f"  [🎬] startgame sent (Blackjack X) "
+                                    f"seat {seat_disp(num)}", Fore.CYAN)
                     elif ev == "stand":
                         occupied.pop(num, None)
                         UI["occupy"].pop(num, None)
@@ -2171,6 +2178,26 @@ def _sitdown(channel: str, seat: str) -> str:
     return (f'<command channel="{channel}">'
             f'<sitdown gameMode="blackjack_desktop" seatNum="{seat}"></sitdown>'
             f'</command>')
+
+
+def _startgame(channel: str, seat: str) -> str:
+    """主动开局 —— 只有 Blackjack X 桌需要。格式取自真人客户端实测帧：
+    <command channel="table-xxx"><startgame gameMode="blackjack_desktop"
+        ck="1792568817794" seatNum="1"></startgame></command>
+    注意：标签是全小写 startgame（不是 startGame），只有 gameMode / ck / seatNum
+    三个参数，没有 tableId / userId / dealNow —— 大写驼峰那条服务端只回 success 不执行。
+    X 桌是纯电子桌、没有荷官推局，坐下后不发这条就永远停在 "Between games"。"""
+    return (f'<command channel="{channel}">'
+            f'<startgame gameMode="blackjack_desktop" ck="{_ck()}" '
+            f'seatNum="{seat}"></startgame>'
+            f'</command>')
+
+
+def is_blackjack_x(name: str) -> bool:
+    """是不是 Blackjack X（纯电子、无真人荷官）桌 —— 只有这类桌才需要主动开局。
+    按桌名（BlackjackX 41 ~ 46）或桌 id（rngbjblarngbjxNN）判断。"""
+    n = str(name or "").replace(" ", "").lower()
+    return "blackjackx" in n or n.startswith("rngbj")
 
 
 def _unseat(channel: str, seat: str) -> str:
