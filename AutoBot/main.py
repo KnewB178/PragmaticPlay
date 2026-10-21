@@ -389,6 +389,15 @@ RECONNECT_MODE_DEFAULT = 2
 RECONNECT_MODES = {1: "strict", 2: "carry-over"}
 # ─────────────────────────────────────────────────────────────
 
+# ── ★ 重连看门狗（只作用于 carry-over 模式的断线自动重连）──
+#     断线后 RECONNECT_TIMEOUT 秒内没有完成接管（装回账本继续跑）→ 整个程序停止。
+#     停止 = 窗口保留、不退出，重新粘 URL 即可再跑。宁可停也不挂着装死。
+#     注意：strict 模式不套这个门（它自己已有「10 秒等基线拿不到就停」，
+#           两个 10 秒叠加会把 strict 变成必停，所以看门狗只管 carry-over）。
+#     改 0 / False = 关闭看门狗，回到无超时行为。
+RECONNECT_TIMEOUT = 10
+# ─────────────────────────────────────────────────────────────
+
 # ── TC 数据源「网络端」(relay feed, pp.knewb2u.com) 开关 ──
 #     True  = 正常行为：连 feed 拿「这张桌已出牌」的现成快照当 TC 基线
 #     False = 完全停用网络端：不做任何 feed 连接；连上桌后直接无基线接管（TC 从 0 起算）
@@ -577,6 +586,9 @@ CARRY = {
     "seat": None,       # 上次坐的座位号（str）；被占就随便找空位
     "ts": None,         # 记录时间（面板/日志用）
 }
+
+# ── 重连看门狗状态（carry-over 专用；deadline=None = 本轮不设防）──
+WATCHDOG = {"deadline": None, "met": False, "fired": False}
 
 
 def _dwidth(s: str) -> int:
@@ -1498,6 +1510,23 @@ import certifi as _certifi
 _WSS_SSL = _ssl.create_default_context(cafile=_certifi.where())
 
 
+async def _reconnect_watchdog(ws):
+    """重连看门狗：断线后 RECONNECT_TIMEOUT 秒还没接管 → 主动关连接，
+    外层看到 WATCHDOG['fired'] 就 stop_forever（窗口保留，人工重开）。"""
+    while WATCHDOG["deadline"] is not None and not WATCHDOG["met"]:
+        left = WATCHDOG["deadline"] - time.monotonic()
+        if left <= 0:
+            WATCHDOG["fired"] = True
+            log(f"  [⏱️] Watchdog: {int(RECONNECT_TIMEOUT)}s 内没有接管 — "
+                f"program STOP (窗口保留，重新粘 URL 再跑)", Fore.RED)
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            return
+        await asyncio.sleep(0.25)
+
+
 async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=None):
     """carry_in = 上一趟断开时留下的鞋级账本（只给 carry-over 机制用）：
        {"cards": [...], "tc": x, "seat": "3"}
@@ -1559,6 +1588,8 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
         UI["taken"] = True
         UI["cards"] = [str(c) for c in shoe.cards]
         update_pdev(shoe.cards)          # 除 TC 外同步算 PDEV（同一份已出牌账本，不用另开）
+        # 接管完成 → 重连看门狗解除
+        WATCHDOG["met"] = True
         # 同步一份「鞋级账本」到 CARRY：断线那一秒它就是最后状态，
         # carry-over 重连时直接拿它接着算。
         CARRY["table"] = name
@@ -1570,6 +1601,9 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
 
     async with websockets.connect(url, ssl=_WSS_SSL if url.startswith("wss") else None) as ws:
         hb_task = asyncio.create_task(_heartbeat(ws, lambda: ch_holder["ch"]))
+        # carry-over 重连 → 起看门狗（deadline=None = 首次连接，不设防）
+        wdt_task = (asyncio.create_task(_reconnect_watchdog(ws))
+                    if WATCHDOG["deadline"] is not None else None)
         clock_task = asyncio.create_task(_noop())   # subscribe 确认后换成真正的连接计时任务
 
         async def initial_report():
@@ -2366,6 +2400,9 @@ async def main():
     asyncio.create_task(balance_task(sid))   # 余额轮询：面板常驻显示
 
     while True:
+        # 看门狗每轮重置：只有「断线后的 carry-over 自动重连」会重新设防
+        WATCHDOG["deadline"] = None
+        WATCHDOG["fired"] = False
         # 需要新基线 → 把 TC 数据源接回来；旧快照清掉（防止拿上一次的旧账当新基线）
         # carry-over 重连不需要基线 → 不接 feed（省一次连上又断开）
         feed_ctl["want"] = USE_FEED and not (need_baseline and reconnect_mode == 2)
@@ -2414,6 +2451,10 @@ async def main():
             log(f"  [♻️] Carry-over: resuming '{name}' with {len(carry_in['cards'])} cards, "
                 f"TC {carry_in['tc']:+.2f} (saved {carry_in['ts'] or '?'}) — no feed wait",
                 Fore.MAGENTA)
+            # ♻️ 看门狗：RECONNECT_TIMEOUT 秒内没接管（没等到下一局 betsopen）→ 整个程序停止
+            WATCHDOG["deadline"] = time.monotonic() + RECONNECT_TIMEOUT
+            WATCHDOG["met"] = False
+            WATCHDOG["fired"] = False
         elif need_baseline and reconnect_mode == 2:
             log("  [♻️] Carry-over: no saved shoe for this table — starting from 0", Fore.YELLOW)
 
@@ -2478,6 +2519,12 @@ async def main():
 
         # 这张桌的连接「结束原因」（停止时显示在面板上）
         exit_reason = exit_reason or stopped_reason or "connection ended"
+
+        # ♻️ 重连看门狗触发 → 无条件停止（余额上下限同款处理）
+        if WATCHDOG["fired"]:
+            await stop_forever(f"reconnect watchdog: no takeover within "
+                               f"{int(RECONNECT_TIMEOUT)}s after disconnect")
+            return
 
         if limit_stop:
             stop_reason = limit_stop                       # 余额上下限 → 停
