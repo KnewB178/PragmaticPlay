@@ -326,8 +326,6 @@ const $=s=>document.querySelector(s)
 const tables={}
 const evCache={}
 let ws=null, curPlayerTable=null, sortMode='tc_desc'
-// 每桌每手的指纹：桌名 → { "4_h0": {sig:"...", co:true} }，用来判断决策提示是否已过期
-let _handSig={}
 const debounceTimers = {}
 let followedPlayer = localStorage.getItem('ppFollowedPlayer') || ''
 let followedBet = localStorage.getItem('ppFollowedBet') || ''
@@ -401,32 +399,6 @@ function handleMsg(d){
         }
         // If cards changed, player made a decision, don't preserve
       }
-    }
-    // ★ 座位「决策提示」过期判定 —— 服务器做完决策后不再推这个座位，
-    //   所以缓存里 canDecide 会一直亮着。用「这一手的牌」当指纹：
-    //   同一手牌 + 仍然带 cashOut 报价 = 还是同一手，继续亮；
-    //   牌变了 或 cashOut 报价没了 = 这一手已经过去 → 清掉。
-    if(hasPlayers){
-      if(!_handSig) _handSig={}
-      var _hs=_handSig[name]||{}
-      for(var _k in tables[name].players){
-        var _pl=tables[name].players[_k]
-        var _sig=(_pl.cards||[]).join(',')
-        var _prev=_hs[_k]
-        if(_pl.canDecide){
-          if(_prev && _prev.sig===_sig && _prev.co && _pl.cashOut===undefined){
-            // 同一手牌、原来有兑现价、现在报价撤了 → 这一手已提交
-            delete _pl.canDecide
-            delete _pl.cashOut
-            _hs[_k]={sig:_sig, co:false}
-          } else {
-            _hs[_k]={sig:_sig, co:(_pl.cashOut!==undefined)}
-          }
-        } else {
-          _hs[_k]={sig:_sig, co:false}
-        }
-      }
-      _handSig[name]=_hs
     }
     render()
     if(curPlayerTable&&curPlayerTable===name) renderPlayerPanel(name)
@@ -633,10 +605,10 @@ function renderPlayerPanel(nm){
     const pname=(d.player_names||{})[seatNum]||''
     const _mine = pname.includes(followedPlayer)
     for(const h of seats[seatNum]){
-      // ★ 触发条件：服务器邀请决策(canDecide) 或 有 cashOut
-      //   旧逻辑只认 cashOut → 没有兑现报价时这一手永远不算 EV
+      // ★ 触发条件只有一个：这一手带 canDecide（= 服务器给了 decisionOffer）
+      //   cashOut 只当作「兑现价」传给 EV，不再作为触发条件
       const _hasCo=(h.cashOut!==undefined && h.cashOut!==null)
-      const _live=!!h.canDecide || _hasCo
+      const _live=!!h.canDecide
       const elId='ev-'+nm+'-'+seatNum+'-'+h.hand
       const el=document.getElementById(elId)
       if(!_mine) continue

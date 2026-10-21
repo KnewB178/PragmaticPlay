@@ -556,39 +556,36 @@ async def listen_ws(table_name, url, row, retry=0):
                                     }
                                     topic = f"pp/decision/{table_name}"
                                     mqtt_client.publish(topic, json.dumps(payload), qos=1)
-                        # ★ 决策状态（单座位就够）：
-                        #   PP 是「顺序轮流」—— 谁收到 decisionOffer，就是轮到谁。
-                        #   所以：这一帧带 offer 的座位 = 现在轮到他；
-                        #         其他所有原本亮着的座位 = 已经做完了 → 立刻熄。
-                        #   不依赖 activeHand（服务器大多帧不带），也不等下一局。
-                        turn = _now_turn(ps_data)      # → 本帧轮到的手集合，如 {"3_h0"}
+                        # ★ 决策状态 —— 「每个座位各自按自己这一帧的真实状态判定」
+                        #
+                        #   实测真相（2026-10-21 抓包 Blackjack 1，MickyCabrera 坐 1&7）：
+                        #   同一帧里可以同时有多个座位 canDecide（7/6/5 三个一起），
+                        #   而没轮到的手连 canDecide / decisionOffer 字段都**不带**。
+                        #   → 所以绝对不能「一有人轮到就把别的手全灭」，
+                        #     那样 7 号亮时把 1 号灭了、1 号亮时把 7 号灭了，永远只剩一个。
+                        #
+                        #   正确规则：只处理「本帧的这个座位」，别的座位一个字都不动。
+                        #   本帧这个座位的手：有 decisionOffer → 亮；没有 → 灭（做完了）
+                        #   （实测 pp/table 帧里没有 decisionTimer / currentDecision 字段）
                         raw_seat = ps_data.get("seatNumber")
                         if raw_seat is not None:
                             mapped_seat = "0" if raw_seat == -1 else str(raw_seat + 1)
                             _dc = decision_cache.setdefault(table_name, {})
-                            # 1) 先按本帧把「轮到的手」点亮
-                            for flat_key in turn:
-                                st = _dc.setdefault(flat_key, {})
-                                st["canDecide"] = True
-                            # 2) 本帧取到的 cashOut 挂上去
                             for hk, hv in ps_data.items():
                                 if not (hk.startswith("h") and isinstance(hv, dict)):
                                     continue
+                                flat_key = f"{mapped_seat}_{hk}"
                                 do = hv.get("decisionOffer")
-                                if isinstance(do, dict) and do.get("cashOut") is not None:
-                                    st = _dc.setdefault(f"{mapped_seat}_{hk}", {})
-                                    st["cashOut"] = do["cashOut"]
-                            # 3) 熄灭：只灭「本帧这个座位」里的手，不动别的座位。
-                            #    ★ 关键：同一玩家可以坐多个座位（如 1/4/5 号），
-                            #      服务器是逐个推送的 —— s5 轮到、s4 轮到、s6 轮到……
-                            #      旧逻辑「一有人轮到就把所有亮着手全灭」会导致
-                            #      s4 开始 → s5 被灭，s6 开始 → s4 被灭 …… 永远只剩一个亮。
-                            #      每个座位的帧只该管自己这个座位。
-                            if turn:
-                                for k, st in _dc.items():
-                                    if k in turn:
-                                        continue
-                                    if k.split("_")[0] == mapped_seat:
+                                if isinstance(do, dict):
+                                    # 轮到这一手 → 亮，并记下兑现价
+                                    st = _dc.setdefault(flat_key, {})
+                                    st["canDecide"] = True
+                                    if do.get("cashOut") is not None:
+                                        st["cashOut"] = do["cashOut"]
+                                else:
+                                    # 本帧这个座位这一手没有邀请 → 已做完，灭
+                                    st = _dc.get(flat_key)
+                                    if isinstance(st, dict):
                                         st.pop("canDecide", None)
                                         st.pop("cashOut", None)
                             decisions = _dc
