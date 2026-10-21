@@ -17,7 +17,6 @@ BASE_DIR = Path(__file__).resolve().parent
 PYTHON = sys.executable
 WSS_SCRIPT = BASE_DIR / "WSS.py"
 PPBJ_SCRIPT = BASE_DIR / "PPBJ.py"
-LOG_FILE = BASE_DIR / "restart_chain.log"
 LOCK_FILE = BASE_DIR / "restart_chain.lock"
 
 STOP_WAIT = 5
@@ -45,10 +44,10 @@ def child_env() -> dict:
 
 
 def log(msg: str) -> None:
+    """只打印到控制台，不再写 restart_chain.log。
+    （原来会往文件里追加，越跑越大；日志只是给人看的，不影响刷新流程。）"""
     line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
     print(line)
-    with LOG_FILE.open("a", encoding="utf-8") as f:
-        f.write(line + "\n")
 
 
 def find_pids(script: str) -> list[int]:
@@ -131,15 +130,15 @@ def start_ppbj() -> None:
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
     else:
         kwargs["start_new_session"] = True
-    with LOG_FILE.open("a", encoding="utf-8") as log_fd:
-        proc = subprocess.Popen(
-            [PYTHON, str(PPBJ_SCRIPT)],
-            cwd=BASE_DIR,
-            stdout=log_fd,
-            stderr=subprocess.STDOUT,
-            env=child_env(),
-            **kwargs,
-        )
+    # PPBJ 是脱离进程启动的，它的屏幕输出没人接收 → 直接丢弃，不再写 restart_chain.log
+    proc = subprocess.Popen(
+        [PYTHON, str(PPBJ_SCRIPT)],
+        cwd=BASE_DIR,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=child_env(),
+        **kwargs,
+    )
     log(f"PPBJ.py 已启动, pid={proc.pid}")
 
 
