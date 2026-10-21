@@ -512,12 +512,12 @@ function renderPlayerPanel(nm){
     body.innerHTML='<div class="pp-empty" style="grid-column:1/-1">No player data</div>'
     return
   }
-  // Update title with TC
-  const tcv = d.tc ?? 0
-  const tcCls = tcv > 0 ? 'g' : tcv < 0 ? 'b' : 'z'
-  const tcsign = tcv > 0 ? '+' : ''
-  
-  $('#pp-title').innerHTML = nm + '<span style="margin-left:20px;color:var(--text-dim)">'+(d.total ?? 0)+'</span><span class="pp-hand-score '+tcCls+'" style="margin-left:20px">'+tcsign+tcv.toFixed(2)+'</span>'
+  // Update title with PDEV (was TC before)
+  const pdv = d.pdev==null?null:Number(d.pdev)*100
+  const pcls = pdv==null?'tc-z':pdv>0?'tc-p':pdv<0?'tc-n':'tc-z'
+  const psign = (pdv!=null&&pdv>0)?'+':''
+
+  $('#pp-title').innerHTML = nm + '<span style="margin-left:20px;color:var(--text-dim)">'+(d.total ?? 0)+'</span><span class="pp-hand-score '+pcls+'" style="margin-left:20px">'+(pdv==null?'-':psign+pdv.toFixed(3)+'%')+'</span>'
   // Dealer
   const dealer = d.dealer
   if(dealer && dealer.cards && dealer.cards.length){
