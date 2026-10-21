@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""停止旧 PPBJ -> 重新抓取/重建 URL -> 启动新 PPBJ 的一键刷新脚本。"""
+"""一键刷新脚本：关闭 receiver + 旧 PPBJ -> 重建 URL -> 先启 receiver -> 再启 PPBJ。"""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ BASE_DIR = Path(__file__).resolve().parent
 PYTHON = sys.executable
 WSS_SCRIPT = BASE_DIR / "WSS.py"
 PPBJ_SCRIPT = BASE_DIR / "PPBJ.py"
+RECEIVER_SCRIPT = BASE_DIR / "pp_receiver_vps.py"
 LOCK_FILE = BASE_DIR / "restart_chain.lock"
 
 STOP_WAIT = 5
@@ -122,6 +123,42 @@ def stop_ppbj() -> None:
             log(f"强制结束失败: {exc}")
 
 
+def stop_receiver() -> None:
+    """刷新前先把现有 receiver 关掉（重启后由本脚本以最新代码重新拉起）。"""
+    pids = [pid for pid in find_pids("pp_receiver_vps.py") if pid != os.getpid()]
+    if not pids:
+        log("未发现运行中的 pp_receiver_vps.py")
+        return
+    log(f"停止 pp_receiver_vps.py, pid={pids}")
+    for pid in pids:
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], check=False)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            log(f"发送停止信号失败: {exc}")
+
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if not find_pids("pp_receiver_vps.py"):
+            log("pp_receiver_vps.py 已退出")
+            return
+        time.sleep(0.5)
+
+    log("pp_receiver_vps.py 未在 15 秒内退出，强制结束")
+    for pid in find_pids("pp_receiver_vps.py"):
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/PID", str(pid), "/T"], check=False)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        except Exception as exc:
+            log(f"强制结束失败: {exc}")
+
+
 def start_ppbj() -> None:
     log(f"等待 {START_WAIT} 秒后启动 PPBJ.py")
     time.sleep(START_WAIT)
@@ -140,6 +177,24 @@ def start_ppbj() -> None:
         **kwargs,
     )
     log(f"PPBJ.py 已启动, pid={proc.pid}")
+
+
+def start_receiver() -> None:
+    """以脱离进程方式拉起最新代码的 receiver（先于 PPBJ，网页先恢复）。"""
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+    else:
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(
+        [PYTHON, str(RECEIVER_SCRIPT)],
+        cwd=BASE_DIR,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=child_env(),
+        **kwargs,
+    )
+    log(f"pp_receiver_vps.py 已启动, pid={proc.pid}")
 
 
 def acquire_lock() -> None:
@@ -190,9 +245,10 @@ def main() -> None:
     acquire_lock()
     try:
         log("=" * 30)
-        log("开始刷新 PP 主程序")
+        log("开始刷新 PP 主程序（含 receiver）")
         if not mqtt_available():
             log(f"[WARNING] MQTT broker 未监听 {MQTT_HOST}:{MQTT_PORT}，PPBJ 可能启动失败")
+        stop_receiver()          # 先关 receiver（网页会短暂断开，稍后自动重连）
         stop_ppbj()
         log(f"等待 {STOP_WAIT} 秒后运行 WSS.py")
         time.sleep(STOP_WAIT)
@@ -202,7 +258,9 @@ def main() -> None:
     finally:
         try:
             stop_ppbj()
-            start_ppbj()
+            start_receiver()     # 先起 receiver → 网页先恢复
+            time.sleep(2)        # 给 receiver 两秒监听端口/连 MQTT
+            start_ppbj()         # 再起 PPBJ
         finally:
             release_lock()
 
