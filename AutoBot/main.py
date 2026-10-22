@@ -22,6 +22,7 @@ PP 自动程序（Python 版 · 新建文件夹，不修改原文件夹任何文
 """
 
 import os, sys, json, time, random, asyncio, configparser, importlib.util, unicodedata
+import subprocess
 import hashlib, socket, uuid          # 机器指纹：自动区分「这是哪一台 VPS」
 import threading
 import traceback
@@ -1038,6 +1039,20 @@ def ask_balance_limits():
         log("  [🎚️] Balance limits: OFF (both disabled) — 不会因余额停止", Fore.CYAN)
     _save_last_inputs(upper=upper, lower=lower)
     return upper, lower
+
+
+def kill_chrome() -> None:
+    """所有启动参数输完（最后一个回车）后杀掉 Google Chrome。
+
+    登入走 websocket 直连，JSESSIONID 已从粘贴的 URL 里拿到，
+    Chrome 只是取 URL 的工具，杀掉不影响程序运行。
+    """
+    try:
+        subprocess.run(["taskkill", "/F", "/IM", "chrome.exe", "/T"],
+                       capture_output=True, timeout=10)
+        log("  [🔪] Chrome 已关闭", Fore.CYAN)
+    except Exception as e:
+        log(f"  [⚠️] 关闭 Chrome 失败（不影响运行）: {e}", Fore.YELLOW)
 
 
 def ask_reconnect_mode() -> int:
@@ -2384,6 +2399,8 @@ async def main():
     # 断线后怎么重连（1 = 严格等基线，2 = 沿用上次鞋账本直接跑）
     reconnect_mode = ask_reconnect_mode()
     UI["reconnect"] = RECONNECT_MODES.get(reconnect_mode, "?")
+
+    kill_chrome()   # 参数全部输完，Chrome（取 URL 用）已无用 → 直接杀掉
 
     if USE_FEED:
         feed = asyncio.create_task(feed_task())
