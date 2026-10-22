@@ -2192,6 +2192,17 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                             log("  [⛔] Kicked from seat by server (stand/timeout)",
                                 Fore.RED)
                             return "kicked from seat by server (stand/timeout)"
+                        # ── Blackjack X：真人全部离桌、桌上只剩我们的座位 → 补发 startgame ──
+                        # 坐下时发过一次；之后最后一个真人走了，服务器不再开新局，
+                        # 不补发就永远等不到下一局 betsopen（空桌验证过的同一条命令）。
+                        if (is_blackjack_x(name) and my_seat["v"]
+                                and not my_pending
+                                and occupied
+                                and all(n in my_seat["v"] for n in occupied)):
+                            await ws.send(_startgame(ch_holder["ch"], my_seat["v"][0]))
+                            log(f"  [🎬] startgame re-sent (Blackjack X, "
+                                f"only us left) seat {seat_disp(my_seat['v'][0])}",
+                                Fore.CYAN)
                     continue
 
                 # ── subscribe 确认 → 记录服务器 channel，立即发首条心跳，并开始计连接时长 ──
