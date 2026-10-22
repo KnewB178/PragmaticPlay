@@ -1567,6 +1567,8 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
     dec_lock = asyncio.Lock()  # 决策发送闸门：多座位时轮流提交，不并发
     seen_dec = set()          # 已打印过的动作回执（去重）
     ins = {"done": None}      # 本局保险是否已回应（按 gameId 记）
+    # X 桌保活用：最近一次见到「局在跑」帧的单调时间（game/betsopen/startDealing/...）
+    game_act = {"ts": time.monotonic()}
 
     def _mine(seat_no) -> bool:
         """这个座位号是不是我们的（支持多座位）"""
@@ -1881,7 +1883,33 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                 f"(EV {ev:+.4f}, amount {amt} each) — replied",
                 Fore.GREEN if buy else Fore.YELLOW)
 
+        async def _startgame_keepalive(ws):
+            """X 桌保活：已坐下、且连续 20 秒没见到任何「局在跑」的帧 → 补发 startgame。
+
+            覆盖两种空桌场景（进桌就没人 / 真人全走光），不再依赖 stand 事件记账。
+            正在打局时帧会不断刷新时间戳 → 不会发；就算在局间隙发了，
+            服务器在打局时也会忽略这条命令（昨天空桌实测的最坏情况就是无反应）。
+            """
+            while True:
+                await asyncio.sleep(5)
+                if not my_seat["v"]:
+                    continue
+                idle = time.monotonic() - game_act["ts"]
+                if idle < 20:
+                    continue
+                seat = my_seat["v"][0]
+                try:
+                    await ws.send(_startgame(ch_holder["ch"], seat))
+                except Exception:
+                    return
+                game_act["ts"] = time.monotonic()   # 节流：发一次后再等一个 idle 周期
+                log(f"  [🎬] startgame keepalive (idle {int(idle)}s, no game) "
+                    f"seat {seat_disp(seat)}", Fore.CYAN)
+
         init_task = asyncio.create_task(initial_report())
+        # X 桌专属：坐下后没有局就定期补发 startgame（真人桌绝不能发）
+        sg_task = (asyncio.create_task(_startgame_keepalive(ws))
+                   if is_blackjack_x(name) else None)
         try:
             confirmed = False
             async for raw in ws:
@@ -1891,6 +1919,12 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
                     d = None
                 if not isinstance(d, dict):
                     continue
+
+                # ── X 桌保活：任何「局在跑」的帧都刷新活动时间戳 ──
+                if ("game" in d or "betsopen" in d or "startDealing" in d
+                        or "startGame" in d or "bjGameEnd" in d
+                        or "playerSeat" in d or "playerState" in d):
+                    game_act["ts"] = time.monotonic()
 
                 # ── 下注被拒：平台回执带 seat（多座位时只有全被拒才拉黑整桌）──
                 if "placebetError" in d or "betValidationError" in d:
@@ -2223,6 +2257,8 @@ async def listen_table(name: str, url: str, min_bet, bet_amount=None, carry_in=N
             clock_task.cancel()
             hb_task.cancel()
             init_task.cancel()
+            if sg_task:
+                sg_task.cancel()
             if bet["task"]:
                 bet["task"].cancel()
             for t in dec_tasks.values():
