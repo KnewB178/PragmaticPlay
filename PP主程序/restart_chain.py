@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""一键刷新脚本：关闭 receiver + 旧 PPBJ -> 重建 URL -> 先启 receiver -> 再启 PPBJ。"""
+"""一键刷新脚本：杀旧 PPBJ -> 重建 URL -> 再启 PPBJ。receiver 全程保持运行，不杀不启。"""
 
 from __future__ import annotations
 
@@ -245,14 +245,12 @@ def main() -> None:
     acquire_lock()
     try:
         log("=" * 30)
-        log("开始刷新 PP 主程序（含 receiver）")
+        log("开始刷新 PP 主程序（receiver 保持运行，不动它）")
         if not mqtt_available():
             log(f"[WARNING] MQTT broker 未监听 {MQTT_HOST}:{MQTT_PORT}，PPBJ 可能启动失败")
         stop_ppbj()
-        stop_receiver()          # 关掉现有 receiver
-        log(f"等待 {STOP_WAIT} 秒后重启 receiver / 运行 WSS.py")
+        log(f"等待 {STOP_WAIT} 秒后运行 WSS.py")
         time.sleep(STOP_WAIT)
-        start_receiver()         # 先把 receiver 拉起来（最新代码）
         log("运行 WSS.py（内部会自动执行 Build_WS_URLs.py）...")
         result = subprocess.run([PYTHON, str(WSS_SCRIPT)], cwd=BASE_DIR, env=child_env())
         log(f"WSS.py 结束, 退出码={result.returncode}")
